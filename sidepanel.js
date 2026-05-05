@@ -169,6 +169,7 @@ function renderAll() {
   for (const msg of conversation.messages) {
     appendMessageElement(msg);
   }
+  markRegenEligible();
   scrollToBottom();
 }
 
@@ -189,9 +190,150 @@ function appendMessageElement(msg) {
     el.appendChild(buildRoundsDetails(msg.rounds));
   }
 
+  attachToolbar(el, msg);
+
   insertActive(el);
   emptyHint.style.display = 'none';
+  markRegenEligible();
   return el;
+}
+
+// =================== Hover toolbar (edit / regenerate) ===================
+
+const ICON_EDIT = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 2.5l2 2-9 9-3 1 1-3 9-9z"/><path d="M10.5 3.5l2 2"/></svg>';
+const ICON_REGEN = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 8a6 6 0 1 1-1.76-4.24"/><polyline points="14 2 14 6 10 6"/></svg>';
+
+function attachToolbar(bubbleEl, msg) {
+  const tools = document.createElement('div');
+  tools.className = 'msg-tools';
+
+  if (msg.role === 'user') {
+    const editBtn = document.createElement('button');
+    editBtn.title = '编辑这条消息（会丢弃后续所有回答并重新生成）';
+    editBtn.innerHTML = ICON_EDIT;
+    editBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      startEditing(bubbleEl, msg);
+    });
+    tools.appendChild(editBtn);
+  } else if (msg.role === 'assistant') {
+    const regenBtn = document.createElement('button');
+    regenBtn.title = '重新生成这条回答';
+    regenBtn.innerHTML = ICON_REGEN;
+    regenBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      regenerateLastAssistant();
+    });
+    tools.appendChild(regenBtn);
+  }
+
+  bubbleEl.appendChild(tools);
+}
+
+// Hide regenerate toolbar on assistant bubbles that aren't the latest one.
+// Eligible: an assistant with no later user msg (queued bubbles don't count).
+function markRegenEligible() {
+  const all = Array.from(messagesEl.querySelectorAll('.msg'));
+  let lastAssistantEl = null;
+  for (const el of all) {
+    if (el.classList.contains('user') && !el.classList.contains('queued')) {
+      lastAssistantEl = null;
+    } else if (el.classList.contains('assistant') && !el.classList.contains('streaming')) {
+      lastAssistantEl = el;
+    }
+  }
+  messagesEl.querySelectorAll('.msg.assistant .msg-tools').forEach(t => {
+    t.style.display = (t.parentElement === lastAssistantEl) ? '' : 'none';
+  });
+}
+
+// =================== Edit user message ===================
+
+function startEditing(bubbleEl, msg) {
+  if (pipelineRunning) return;
+  bubbleEl.classList.add('editing');
+
+  const editor = document.createElement('div');
+  editor.className = 'edit-area';
+
+  const textarea = document.createElement('textarea');
+  textarea.value = msg.content;
+  textarea.rows = Math.max(2, Math.min(8, msg.content.split('\n').length + 1));
+
+  const btnRow = document.createElement('div');
+  btnRow.className = 'edit-buttons';
+  const cancelBtn = document.createElement('button');
+  cancelBtn.className = 'edit-cancel';
+  cancelBtn.textContent = '取消';
+  const saveBtn = document.createElement('button');
+  saveBtn.className = 'edit-save';
+  saveBtn.textContent = '保存重发';
+  btnRow.appendChild(cancelBtn);
+  btnRow.appendChild(saveBtn);
+
+  editor.appendChild(textarea);
+  editor.appendChild(btnRow);
+  bubbleEl.appendChild(editor);
+
+  textarea.focus();
+  textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+
+  const cleanup = () => {
+    editor.remove();
+    bubbleEl.classList.remove('editing');
+  };
+
+  cancelBtn.addEventListener('click', cleanup);
+  textarea.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); cleanup(); }
+    else if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      saveBtn.click();
+    }
+  });
+
+  saveBtn.addEventListener('click', async () => {
+    const newText = textarea.value.trim();
+    if (!newText) return;
+    const idx = conversation.messages.indexOf(msg);
+    if (idx < 0) { cleanup(); return; }
+    cleanup();
+
+    // Drop this user msg and ALL subsequent (assistant + later turns)
+    conversation.messages = conversation.messages.slice(0, idx);
+    await persist();
+    renderAll();
+
+    if (pipelineRunning) {
+      enqueueMessage(newText);
+    } else {
+      await processMessage(newText);
+      await drainQueue();
+    }
+  });
+}
+
+// =================== Regenerate last assistant ===================
+
+async function regenerateLastAssistant() {
+  if (pipelineRunning) return;
+
+  let assistantIdx = -1;
+  for (let i = conversation.messages.length - 1; i >= 0; i--) {
+    if (conversation.messages[i].role === 'assistant') { assistantIdx = i; break; }
+  }
+  if (assistantIdx < 1) return;
+  const userMsg = conversation.messages[assistantIdx - 1];
+  if (!userMsg || userMsg.role !== 'user') return;
+
+  // Drop the assistant + anything after, keep the user msg
+  conversation.messages = conversation.messages.slice(0, assistantIdx);
+  await persist();
+  renderAll();
+
+  // Run pipeline using existing user msg (don't push a new one)
+  await processMessage(userMsg.content, null, /*skipPushUser=*/true);
+  await drainQueue();
 }
 
 // Insert "active" content (just-sent user msg, thinking, streaming, finalized
@@ -237,6 +379,10 @@ function renderMarkdown(src) {
   s = escapeHtml(s);
 
   // 3. Block elements
+  // Setext-style headers (text on one line, === or --- on next)
+  s = s.replace(/^(.+)\n=+\s*$/gm, '<h1>$1</h1>');
+  s = s.replace(/^(.+)\n-+\s*$/gm, '<h2>$1</h2>');
+  // ATX-style headers
   s = s.replace(/^###### (.+)$/gm, '<h6>$1</h6>');
   s = s.replace(/^##### (.+)$/gm, '<h5>$1</h5>');
   s = s.replace(/^#### (.+)$/gm, '<h4>$1</h4>');
@@ -244,6 +390,19 @@ function renderMarkdown(src) {
   s = s.replace(/^## (.+)$/gm, '<h2>$1</h2>');
   s = s.replace(/^# (.+)$/gm, '<h1>$1</h1>');
   s = s.replace(/^[-*_]{3,}\s*$/gm, '<hr>');
+
+  // Fallback: when models drop the `# ` prefix on our prescribed Final
+  // section labels, still treat those bare lines as H1 headings.
+  const FINAL_SECTIONS = [
+    '最终结论', '综合答案',
+    '三个模型的主要共识', '主要分歧与裁决',
+    '可执行方案', '仍需验证的信息'
+  ];
+  const finalSectionRe = new RegExp(
+    '^\\s*(' + FINAL_SECTIONS.map(x => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')\\s*$',
+    'gm'
+  );
+  s = s.replace(finalSectionRe, '<h1>$1</h1>');
   s = mdProcessLists(s);
   s = s.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
   s = s.replace(/<\/blockquote>\n<blockquote>/g, '<br>');
@@ -407,13 +566,15 @@ function updateStreamingBubble(text) {
   if (nearBottom) scrollToBottom();
 }
 
-function finalizeStreamingBubble(finalText, rounds) {
+function finalizeStreamingBubble(finalText, rounds, msg) {
   if (!streamingBubble) return false;
   const content = streamingBubble.querySelector('.markdown');
   if (content) content.innerHTML = renderMarkdown(finalText);
   streamingBubble.classList.remove('streaming');
   if (rounds) streamingBubble.appendChild(buildRoundsDetails(rounds));
+  if (msg) attachToolbar(streamingBubble, msg);
   streamingBubble = null;
+  markRegenEligible();
   return true;
 }
 
@@ -460,20 +621,24 @@ async function drainQueue() {
   }
 }
 
-async function processMessage(text, existingBubble) {
+async function processMessage(text, existingBubble, skipPushUser) {
   pipelineRunning = true;
   setRunning(true);
 
-  const userMsg = { role: 'user', content: text, ts: Date.now() };
-  conversation.messages.push(userMsg);
-  if (existingBubble && existingBubble.isConnected) {
-    // promote the queued bubble in-place to a regular user bubble
-    existingBubble.classList.remove('queued');
-    currentUserBubble = existingBubble;
+  if (!skipPushUser) {
+    const userMsg = { role: 'user', content: text, ts: Date.now() };
+    conversation.messages.push(userMsg);
+    if (existingBubble && existingBubble.isConnected) {
+      existingBubble.classList.remove('queued');
+      currentUserBubble = existingBubble;
+    } else {
+      currentUserBubble = appendMessageElement(userMsg);
+    }
+    await persist();
   } else {
-    currentUserBubble = appendMessageElement(userMsg);
+    // regenerate path: user msg already in conversation, no DOM change needed
+    currentUserBubble = null;
   }
-  await persist();
 
   scrollToBottom();
 
@@ -495,15 +660,19 @@ async function processMessage(text, existingBubble) {
     clearThinking();
 
     if (response?.cancelled) {
-      // Roll back: remove streaming bubble + user bubble for this turn
       removeStreamingBubble();
-      if (currentUserBubble) {
-        currentUserBubble.remove();
-        currentUserBubble = null;
+      if (!skipPushUser) {
+        // Normal turn: roll back the user message we optimistically added
+        if (currentUserBubble) {
+          currentUserBubble.remove();
+          currentUserBubble = null;
+        }
+        conversation.messages.pop();
+        await persist();
+        promptEl.value = text;
       }
-      conversation.messages.pop();
-      await persist();
-      promptEl.value = text; // restore so user can edit + resend
+      // For regenerate cancel: leave the existing user msg in place,
+      // user can hit regenerate again or edit.
       return;
     }
 
@@ -529,7 +698,7 @@ async function processMessage(text, existingBubble) {
 
     // If streaming already created a bubble, finalize it in-place;
     // otherwise (no partials arrived) append a fresh bubble.
-    const finalized = finalizeStreamingBubble(finalText, assistantMsg.rounds);
+    const finalized = finalizeStreamingBubble(finalText, assistantMsg.rounds, assistantMsg);
     if (!finalized) {
       appendMessageElement(assistantMsg);
     }
@@ -553,11 +722,11 @@ function removeLastMessageElement() {
 }
 
 function setRunning(running) {
-  // Input + send always enabled — typing during a run queues the next message.
   promptEl.disabled = false;
   sendBtn.disabled = false;
   sendBtn.hidden = false;
   stopBtn.hidden = !running;
+  document.body.classList.toggle('pipeline-running', running);
 }
 
 async function cancelPipeline() {

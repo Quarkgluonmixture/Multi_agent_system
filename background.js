@@ -238,10 +238,10 @@ async function pingContentScript(tabId, maxAttempts = 30) {
 
 async function pollUntilStable(tabId, provider, signal, onPartial) {
   const STABLE_MS = 3000;
-  // With rotation keepalive (cycle 2s × 3 pending = 6s per-tab gap), text in
-  // a hidden tab can be stale for up to ~6s between activations. Fallback
-  // must outlast that gap with a small buffer.
-  const FALLBACK_STABLE_MS = 7000;
+  // Fallback must outlast both the keepalive per-tab gap AND any natural
+  // model pause between sentences/paragraphs. 10s is conservative — slow
+  // detection by ~3s but avoids truncating long Final outputs.
+  const FALLBACK_STABLE_MS = 10000;
   const TIMEOUT_MS = 300000;
   const POLL_MS = 500;
   const FIRST_TEXT_TIMEOUT_MS = 90000;
@@ -629,25 +629,32 @@ ${userPrompt}
 
 ${sections}
 
-请严格按以下结构输出 markdown：
+输出格式要求（必须严格遵守，否则下游渲染会失败）：
+
+1. 每个分节标题**必须**以 \`# \`（井号 + 空格）开头。例如写 \`# 最终结论\`，不要只写"最终结论"或加冒号。
+2. 重点词语用 \`**xxx**\` 包起来加粗，例如 \`**规模优势**\`。
+3. 列表用 \`- \` 或 \`1. \` 开头。
+4. 不要在输出最外层包 \`<answer>\`、\`<revision>\` 等任何 XML 标签——这是给最终用户的，不是给下游 agent 的。
+
+请严格按以下六个分节输出（顺序固定，标题文字一字不差）：
 
 # 最终结论
 （一两句话直接给答案，不要套话）
 
 # 综合答案
-（完整、可读、自包含的回答正文。这是用户实际要看的内容）
+（完整、可读、自包含的回答正文。这是用户实际要看的内容；可以再分小节用 \`## 子标题\`，可以用列表）
 
 # 三个模型的主要共识
-（哪些点三家都赞成）
+（哪些点三家都赞成，列表形式）
 
 # 主要分歧与裁决
-（哪些点有分歧，你作为主编最终选择哪一边，理由）
+（哪些点有分歧，你作为主编最终选择哪一边，给理由）
 
 # 可执行方案
-（如果适用：用户下一步该做什么）
+（如果适用：用户下一步该做什么；列表形式）
 
 # 仍需验证的信息
-（哪些事实/前提还没确认，用户应该自己核实哪些）`;
+（哪些事实/前提还没确认，用户应该自己核实哪些；列表形式）`;
 }
 
 // =================== Full pipeline orchestrator ===================

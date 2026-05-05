@@ -236,7 +236,10 @@
   window.__multiAIPollState = function () {
     try {
       const messages = getAssistantMessages();
-      const text = messages[messages.length - 1]?.innerText ?? '';
+      const last = messages[messages.length - 1];
+      // Use the same DOM→Markdown extraction as final capture, so streaming
+      // stable-text comparison sees the same content the user will see.
+      const text = last ? domToMarkdown(last).trim() : '';
       return {
         provider: config.id,
         text,
@@ -308,7 +311,102 @@
 
   function getLatestAssistantText() {
     const msgs = getAssistantMessages();
-    return msgs[msgs.length - 1]?.innerText?.trim() ?? '';
+    const last = msgs[msgs.length - 1];
+    if (!last) return '';
+    // domToMarkdown preserves structure (lists, bold, links, code) that
+    // innerText silently strips — that's what was making numbered lists
+    // collapse to "1. 1. 1." and bold disappear when piped to next round.
+    return domToMarkdown(last).trim();
+  }
+
+  // Lightweight HTML→Markdown converter. Walks the DOM and emits markdown
+  // tokens for the elements assistant UIs actually use.
+  function domToMarkdown(root) {
+    if (!root) return '';
+
+    const walk = (node) => {
+      if (node.nodeType === Node.TEXT_NODE) return node.textContent;
+      if (node.nodeType !== Node.ELEMENT_NODE) return '';
+
+      const tag = node.tagName.toLowerCase();
+
+      switch (tag) {
+        case 'br': return '\n';
+        case 'hr': return '\n---\n';
+        case 'p':  return walkChildren(node) + '\n\n';
+        case 'h1': return '\n# '   + walkChildren(node).trim() + '\n\n';
+        case 'h2': return '\n## '  + walkChildren(node).trim() + '\n\n';
+        case 'h3': return '\n### ' + walkChildren(node).trim() + '\n\n';
+        case 'h4': return '\n#### ' + walkChildren(node).trim() + '\n\n';
+        case 'h5': return '\n##### ' + walkChildren(node).trim() + '\n\n';
+        case 'h6': return '\n###### ' + walkChildren(node).trim() + '\n\n';
+        case 'strong': case 'b':
+          return '**' + walkChildren(node) + '**';
+        case 'em': case 'i':
+          return '*' + walkChildren(node) + '*';
+        case 'del': case 's': case 'strike':
+          return '~~' + walkChildren(node) + '~~';
+        case 'a': {
+          const href = node.getAttribute('href') || '';
+          const text = walkChildren(node);
+          return href && href !== text ? `[${text}](${href})` : text;
+        }
+        case 'code': {
+          if (node.parentElement && node.parentElement.tagName === 'PRE') {
+            return node.textContent;
+          }
+          return '`' + node.textContent + '`';
+        }
+        case 'pre': {
+          const code = node.querySelector('code');
+          const text = (code ? code.textContent : node.textContent).replace(/\n+$/, '');
+          return '\n```\n' + text + '\n```\n\n';
+        }
+        case 'ol': {
+          const items = Array.from(node.children).filter(c => c.tagName === 'LI');
+          return '\n' + items.map((li, i) =>
+            (i + 1) + '. ' + walkChildren(li).trim().replace(/\n/g, '\n   ')
+          ).join('\n') + '\n\n';
+        }
+        case 'ul': {
+          const items = Array.from(node.children).filter(c => c.tagName === 'LI');
+          return '\n' + items.map(li =>
+            '- ' + walkChildren(li).trim().replace(/\n/g, '\n  ')
+          ).join('\n') + '\n\n';
+        }
+        case 'li': return walkChildren(node);
+        case 'blockquote':
+          return '\n' + walkChildren(node).trim().split('\n').map(l => '> ' + l).join('\n') + '\n\n';
+        case 'table': {
+          const rows = Array.from(node.querySelectorAll('tr'));
+          if (rows.length === 0) return '';
+          const cells = rows.map(tr =>
+            Array.from(tr.children).map(td => td.textContent.trim().replace(/\|/g, '\\|'))
+          );
+          const cols = Math.max(...cells.map(r => r.length));
+          const lines = [
+            '| ' + cells[0].join(' | ') + ' |',
+            '|' + Array(cols).fill('---').join('|') + '|',
+            ...cells.slice(1).map(r => '| ' + r.join(' | ') + ' |')
+          ];
+          return '\n' + lines.join('\n') + '\n\n';
+        }
+        case 'script': case 'style': case 'noscript':
+          return '';
+        default:
+          return walkChildren(node);
+      }
+    };
+
+    const walkChildren = (node) => {
+      let out = '';
+      for (const c of node.childNodes) out += walk(c);
+      return out;
+    };
+
+    return walk(root)
+      .replace(/[ \t]+\n/g, '\n')      // trim trailing spaces on each line
+      .replace(/\n{3,}/g, '\n\n');     // collapse 3+ blank lines
   }
 
   function setInputValue(input, value) {
