@@ -1,8 +1,11 @@
 // =================== State ===================
 
 let conversation = { messages: [] };
-let currentThinking = null; // DOM element for the active "thinking" bubble
-let streamingBubble = null; // DOM element for in-progress Final answer
+let currentThinking = null;   // active "thinking" bubble
+let streamingBubble = null;   // in-progress Final answer bubble
+let currentUserBubble = null; // user bubble of the message currently being processed
+let pipelineRunning = false;
+const messageQueue = [];      // [{ text, bubbleEl }] queued during a run
 
 const STORAGE_KEY = 'conversation';
 const THEME_KEY = 'theme';
@@ -174,17 +177,133 @@ function appendMessageElement(msg) {
   el.className = `msg ${msg.role}`;
 
   const content = document.createElement('div');
-  content.className = msg.role === 'assistant' ? 'markdown' : '';
-  content.textContent = msg.content;
+  if (msg.role === 'assistant') {
+    content.className = 'markdown';
+    content.innerHTML = renderMarkdown(msg.content);
+  } else {
+    content.textContent = msg.content;
+  }
   el.appendChild(content);
 
   if (msg.role === 'assistant' && msg.rounds) {
     el.appendChild(buildRoundsDetails(msg.rounds));
   }
 
-  messagesEl.appendChild(el);
+  insertActive(el);
   emptyHint.style.display = 'none';
   return el;
+}
+
+// Insert "active" content (just-sent user msg, thinking, streaming, finalized
+// assistant) BEFORE any queued user bubbles, so the queue stays at the bottom.
+function insertActive(el) {
+  const firstQueued = messagesEl.querySelector('.msg.user.queued');
+  if (firstQueued) {
+    messagesEl.insertBefore(el, firstQueued);
+  } else {
+    messagesEl.appendChild(el);
+  }
+}
+
+// =================== Minimal markdown renderer ===================
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function renderMarkdown(src) {
+  if (!src) return '';
+  let s = String(src);
+
+  // 1. Pull out fenced code blocks + inline code BEFORE escaping, so their
+  //    contents survive the rest of the rules untouched.
+  const fenced = [];
+  s = s.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+    fenced.push({ lang, code });
+    return `CB${fenced.length - 1}`;
+  });
+  const inline = [];
+  s = s.replace(/`([^`\n]+?)`/g, (_, code) => {
+    inline.push(code);
+    return `IC${inline.length - 1}`;
+  });
+
+  // 2. Escape everything else
+  s = escapeHtml(s);
+
+  // 3. Block elements
+  s = s.replace(/^###### (.+)$/gm, '<h6>$1</h6>');
+  s = s.replace(/^##### (.+)$/gm, '<h5>$1</h5>');
+  s = s.replace(/^#### (.+)$/gm, '<h4>$1</h4>');
+  s = s.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+  s = s.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+  s = s.replace(/^# (.+)$/gm, '<h1>$1</h1>');
+  s = s.replace(/^[-*_]{3,}\s*$/gm, '<hr>');
+  s = mdProcessLists(s);
+  s = s.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
+  s = s.replace(/<\/blockquote>\n<blockquote>/g, '<br>');
+
+  // 4. Inline elements
+  s = s.replace(/\*\*([^*\n]+?)\*\*/g, '<strong>$1</strong>');
+  s = s.replace(/(^|[^*\w])\*([^*\n]+?)\*(?!\w)/g, '$1<em>$2</em>');
+  s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g,
+    '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+
+  // 5. Wrap loose blocks in <p> (skip lines that are already block-level)
+  s = s.split(/\n{2,}/).map(block => {
+    block = block.trim();
+    if (!block) return '';
+    if (/^<(h[1-6]|ul|ol|pre|blockquote|hr|p)\b/.test(block)) return block;
+    return `<p>${block.replace(/\n/g, '<br>')}</p>`;
+  }).filter(b => b).join('\n');
+
+  // 6. Restore code (escaping at this stage so HTML inside is safe)
+  s = s.replace(/IC(\d+)/g, (_, i) =>
+    `<code>${escapeHtml(inline[+i])}</code>`);
+  s = s.replace(/CB(\d+)/g, (_, i) => {
+    const { lang, code } = fenced[+i];
+    const langAttr = lang ? ` data-lang="${escapeHtml(lang)}"` : '';
+    return `<pre><code${langAttr}>${escapeHtml(code)}</code></pre>`;
+  });
+
+  return s;
+}
+
+function mdProcessLists(s) {
+  const lines = s.split('\n');
+  const out = [];
+  let listType = null;
+  let buffer = [];
+  const flush = () => {
+    if (buffer.length) {
+      out.push(`<${listType}>${buffer.join('')}</${listType}>`);
+      buffer = [];
+    }
+    listType = null;
+  };
+  for (const line of lines) {
+    const ul = line.match(/^\s*[-*]\s+(.+)$/);
+    const ol = line.match(/^\s*\d+\.\s+(.+)$/);
+    if (ul) {
+      if (listType !== 'ul') flush();
+      listType = 'ul';
+      buffer.push(`<li>${ul[1]}</li>`);
+    } else if (ol) {
+      if (listType !== 'ol') flush();
+      listType = 'ol';
+      buffer.push(`<li>${ol[1]}</li>`);
+    } else {
+      flush();
+      out.push(line);
+    }
+  }
+  flush();
+  return out.join('\n');
 }
 
 function buildRoundsDetails(rounds) {
@@ -221,8 +340,8 @@ function appendRoundBlock(parent, title, providerOutputs) {
     item.appendChild(name);
 
     const text = document.createElement('div');
-    text.className = 'ptext';
-    text.textContent = output;
+    text.className = 'ptext markdown';
+    text.innerHTML = renderMarkdown(output);
     item.appendChild(text);
 
     block.appendChild(item);
@@ -241,7 +360,7 @@ function showThinking() {
   currentThinking = document.createElement('div');
   currentThinking.className = 'msg thinking';
   currentThinking.textContent = '正在思考...';
-  messagesEl.appendChild(currentThinking);
+  insertActive(currentThinking);
   emptyHint.style.display = 'none';
   scrollToBottom();
 }
@@ -273,9 +392,9 @@ function startStreamingBubble(text) {
   streamingBubble.className = 'msg assistant streaming';
   const content = document.createElement('div');
   content.className = 'markdown';
-  content.textContent = text;
+  content.innerHTML = renderMarkdown(text);
   streamingBubble.appendChild(content);
-  messagesEl.appendChild(streamingBubble);
+  insertActive(streamingBubble);
   emptyHint.style.display = 'none';
   scrollToBottom();
 }
@@ -283,8 +402,7 @@ function startStreamingBubble(text) {
 function updateStreamingBubble(text) {
   if (!streamingBubble) return;
   const content = streamingBubble.querySelector('.markdown');
-  if (content) content.textContent = text;
-  // gentle scroll only if user is already near bottom (don't yank them up)
+  if (content) content.innerHTML = renderMarkdown(text);
   const nearBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 80;
   if (nearBottom) scrollToBottom();
 }
@@ -292,7 +410,7 @@ function updateStreamingBubble(text) {
 function finalizeStreamingBubble(finalText, rounds) {
   if (!streamingBubble) return false;
   const content = streamingBubble.querySelector('.markdown');
-  if (content) content.textContent = finalText;
+  if (content) content.innerHTML = renderMarkdown(finalText);
   streamingBubble.classList.remove('streaming');
   if (rounds) streamingBubble.appendChild(buildRoundsDetails(rounds));
   streamingBubble = null;
@@ -312,14 +430,51 @@ async function send() {
   const text = promptEl.value.trim();
   if (!text) return;
 
+  promptEl.value = '';
+
+  // If a pipeline is already running, queue this message instead.
+  // It'll be processed when the current run finishes.
+  if (pipelineRunning) {
+    enqueueMessage(text);
+    return;
+  }
+
+  await processMessage(text);
+  await drainQueue();
+}
+
+function enqueueMessage(text) {
+  const el = document.createElement('div');
+  el.className = 'msg user queued';
+  el.textContent = text;
+  messagesEl.appendChild(el);
+  emptyHint.style.display = 'none';
+  scrollToBottom();
+  messageQueue.push({ text, bubbleEl: el });
+}
+
+async function drainQueue() {
+  while (messageQueue.length > 0) {
+    const next = messageQueue.shift();
+    await processMessage(next.text, next.bubbleEl);
+  }
+}
+
+async function processMessage(text, existingBubble) {
+  pipelineRunning = true;
   setRunning(true);
 
   const userMsg = { role: 'user', content: text, ts: Date.now() };
   conversation.messages.push(userMsg);
-  appendMessageElement(userMsg);
+  if (existingBubble && existingBubble.isConnected) {
+    // promote the queued bubble in-place to a regular user bubble
+    existingBubble.classList.remove('queued');
+    currentUserBubble = existingBubble;
+  } else {
+    currentUserBubble = appendMessageElement(userMsg);
+  }
   await persist();
 
-  promptEl.value = '';
   scrollToBottom();
 
   showThinking();
@@ -340,10 +495,13 @@ async function send() {
     clearThinking();
 
     if (response?.cancelled) {
-      // Roll back: remove streaming bubble (if it appeared) AND user message
+      // Roll back: remove streaming bubble + user bubble for this turn
       removeStreamingBubble();
+      if (currentUserBubble) {
+        currentUserBubble.remove();
+        currentUserBubble = null;
+      }
       conversation.messages.pop();
-      removeLastMessageElement();
       await persist();
       promptEl.value = text; // restore so user can edit + resend
       return;
@@ -382,8 +540,9 @@ async function send() {
     clearThinking();
     showError(err.message ?? String(err));
   } finally {
+    currentUserBubble = null;
+    pipelineRunning = false;
     setRunning(false);
-    promptEl.focus();
   }
 }
 
@@ -394,9 +553,10 @@ function removeLastMessageElement() {
 }
 
 function setRunning(running) {
-  promptEl.disabled = running;
-  sendBtn.disabled = running;
-  sendBtn.hidden = running;
+  // Input + send always enabled — typing during a run queues the next message.
+  promptEl.disabled = false;
+  sendBtn.disabled = false;
+  sendBtn.hidden = false;
   stopBtn.hidden = !running;
 }
 
@@ -458,9 +618,14 @@ chrome.runtime.onMessage.addListener((msg) => {
 // =================== Clear conversation ===================
 
 clearBtn.addEventListener('click', async () => {
-  if (conversation.messages.length === 0) return;
-  if (!confirm('清空当前对话？这会删除所有消息。')) return;
+  if (conversation.messages.length === 0 && messageQueue.length === 0) return;
+  if (!confirm('清空当前对话？这会删除所有消息和排队中的消息。')) return;
   conversation = { messages: [] };
+  // also flush any queued messages and their visual bubbles
+  for (const q of messageQueue) {
+    if (q.bubbleEl) q.bubbleEl.remove();
+  }
+  messageQueue.length = 0;
   await persist();
   renderAll();
 });

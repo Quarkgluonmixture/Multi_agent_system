@@ -15,6 +15,8 @@
       --text-muted:     #aaaaaa;
       --border:         #dddddd;
       --border-soft:    #eeeeee;
+      --code-bg:        #f0f0f2;
+      --link:           #2563eb;
 
       --input-bg:       #ffffff;
       --input-border:   #cccccc;
@@ -59,6 +61,8 @@
       --text-muted:     #666666;
       --border:         #3a3a3e;
       --border-soft:    #2c2c2f;
+      --code-bg:        #1a1a1d;
+      --link:           #60a5fa;
 
       --input-bg:       #2a2a2e;
       --input-border:   #444444;
@@ -220,14 +224,26 @@
       max-width: 88%;
       padding: 8px 12px;
       border-radius: 10px;
-      line-height: 1.5;
+      line-height: 1.55;
       word-wrap: break-word;
-      white-space: pre-wrap;
     }
     .msg.user {
       align-self: flex-end;
       background: var(--user-bg);
       color: var(--user-text);
+      white-space: pre-wrap;
+    }
+    .msg.user.queued {
+      opacity: 0.55;
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.25);
+    }
+    .msg.user.queued::before {
+      content: '排队中 · ';
+      font-size: 10px;
+      letter-spacing: 0.05em;
+      opacity: 0.85;
+      display: block;
+      margin-bottom: 2px;
     }
     .msg.assistant {
       align-self: flex-start;
@@ -236,6 +252,62 @@
       color: var(--text);
       max-width: 95%;
     }
+
+    /* ===== Markdown rendering inside assistant bubbles ===== */
+    .markdown { font-size: 13px; }
+    .markdown > *:first-child { margin-top: 0; }
+    .markdown > *:last-child { margin-bottom: 0; }
+    .markdown h1, .markdown h2, .markdown h3,
+    .markdown h4, .markdown h5, .markdown h6 {
+      font-weight: 600;
+      margin: 12px 0 4px;
+      line-height: 1.3;
+    }
+    .markdown h1 { font-size: 16px; }
+    .markdown h2 { font-size: 14px; }
+    .markdown h3 { font-size: 13px; }
+    .markdown h4, .markdown h5, .markdown h6 { font-size: 12.5px; }
+    .markdown p { margin: 6px 0; }
+    .markdown ul, .markdown ol { margin: 6px 0; padding-left: 22px; }
+    .markdown li { margin: 2px 0; }
+    .markdown li > p { margin: 2px 0; }
+    .markdown strong { font-weight: 600; }
+    .markdown em { font-style: italic; }
+    .markdown a { color: var(--link); text-decoration: underline; }
+    .markdown blockquote {
+      border-left: 3px solid var(--border);
+      padding: 2px 0 2px 10px;
+      color: var(--text-dim);
+      margin: 6px 0;
+    }
+    .markdown hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 10px 0;
+    }
+    .markdown code {
+      font-family: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, "Liberation Mono", monospace;
+      font-size: 11.5px;
+      background: var(--code-bg);
+      padding: 1px 5px;
+      border-radius: 3px;
+    }
+    .markdown pre {
+      background: var(--code-bg);
+      padding: 8px 10px;
+      border-radius: 4px;
+      overflow-x: auto;
+      margin: 6px 0;
+      font-size: 11.5px;
+      line-height: 1.4;
+    }
+    .markdown pre code {
+      background: transparent;
+      padding: 0;
+      border-radius: 0;
+      display: block;
+      white-space: pre;
+    }
     .msg.thinking {
       align-self: flex-start;
       background: var(--thinking-bg);
@@ -243,12 +315,14 @@
       color: var(--thinking-text);
       font-style: italic;
       font-size: 12px;
+      white-space: pre-wrap;
     }
     .msg.error {
       align-self: flex-start;
       background: var(--error-bg);
       border: 1px solid var(--error-border);
       color: var(--error-text);
+      white-space: pre-wrap;
     }
 
     /* streaming cursor on in-progress assistant message */
@@ -308,10 +382,10 @@
     .round-item[data-provider="gemini"]   { border-left-color: #4285f4; }
     .round-item[data-provider="deepseek"] { border-left-color: #6366f1; }
     .round-item .ptext {
-      white-space: pre-wrap;
-      max-height: 200px;
+      max-height: 220px;
       overflow-y: auto;
     }
+    .round-item .ptext.markdown { font-size: 11px; }
 
     .input-bar {
       flex-shrink: 0;
@@ -390,7 +464,7 @@
 </head>
 <body>
   <div class="header">
-    <h1>Multi AI Chat · v0.13</h1>
+    <h1>Multi AI Chat · v0.14</h1>
     <div class="actions">
       <button id="theme-btn" title="切换主题">深色</button>
       <button id="clear-btn" title="清空对话">新对话</button>

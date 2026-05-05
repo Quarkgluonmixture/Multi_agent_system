@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
-  "name": "Multi AI Chat (v0.13)",
-  "version": "0.0.13",
+  "name": "Multi AI Chat (v0.14)",
+  "version": "0.0.14",
   "description": "Multi-turn chat that runs every message through a 3-round multi-AI deliberation.",
   "permissions": ["tabs", "sidePanel", "scripting", "storage"],
   "host_permissions": [
