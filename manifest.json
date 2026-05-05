@@ -1,0 +1,39 @@
+{
+  "manifest_version": 3,
+  "name": "Multi AI Chat (v0.13)",
+  "version": "0.0.13",
+  "description": "Multi-turn chat that runs every message through a 3-round multi-AI deliberation.",
+  "permissions": ["tabs", "sidePanel", "scripting", "storage"],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*",
+    "https://gemini.google.com/*",
+    "https://chat.deepseek.com/*",
+    "https://www.kimi.com/*",
+    "https://kimi.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "action": {
+    "default_title": "Multi AI Orchestrator"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*",
+        "https://gemini.google.com/*",
+        "https://chat.deepseek.com/*",
+        "https://www.kimi.com/*",
+        "https://kimi.com/*"
+      ],
+      "js": ["content_adapter.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
