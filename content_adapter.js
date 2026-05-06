@@ -159,7 +159,12 @@
       stopButtonSelectors: [
         'button[aria-label*="停止"]',
         'button[aria-label*="Stop" i]',
-        'div[role="button"][aria-label*="停止"]'
+        'button[aria-label*="终止" i]',
+        'button[class*="stop" i]',
+        'button[class*="Stop" i]',
+        'div[role="button"][aria-label*="停止"]',
+        'div[role="button"][class*="stop" i]',
+        '[data-testid*="stop" i]'
       ],
       assistantMessageSelectors: [
         '[data-role="assistant"]',
@@ -229,6 +234,80 @@
 
   const config = detectConfig();
   if (!config) return;
+
+  // CRITICAL: filter out nested sub-frames. With all_frames: true, content
+  // scripts inject into EVERY frame matching the URL pattern — including
+  // anti-bot / sandbox sub-frames the AI sites add inside themselves
+  // (e.g. Gemini's `gemini.google.com/_/bscframe`). If those sub-frames
+  // register as `provider=gemini`, they overwrite the real iframe's frameId
+  // in SW and the pipeline starts talking to the wrong frame.
+  //
+  // Only register if we're a DIRECT child of the top-level page (i.e. one
+  // of the 4 grid.html iframes), or in a top-level tab (direct browsing).
+  const inIframe = window.top !== window.self;
+  let isDirectChildOfTop = true;
+  if (inIframe) {
+    try {
+      isDirectChildOfTop = window.parent === window.top;
+    } catch (_) {
+      isDirectChildOfTop = false;
+    }
+  }
+
+  if (inIframe && !isDirectChildOfTop) {
+    // We're a nested sub-frame inside a provider iframe. Don't register,
+    // don't run autoInit, don't expose handlers — let the real provider
+    // iframe own the (tab, provider) mapping.
+    return;
+  }
+
+  try {
+    chrome.runtime.sendMessage({
+      type: 'CONTENT_SCRIPT_REGISTER',
+      provider: config.id,
+      inIframe
+    }).catch(() => {});
+  } catch (_) {}
+
+  // =================== Auto-init per provider ===================
+  // Runs once on content-script load. Handles initial-state quirks (cookie
+  // banners, temp-chat activation) so each iframe is "clean" before any
+  // pipeline message arrives.
+
+  function findCookieAcceptButton() {
+    const labels = ['接受全部', 'Accept all', '全部接受', '同意全部', '我同意'];
+    const candidates = Array.from(document.querySelectorAll('button, [role="button"]'));
+    return candidates.find(b => {
+      const text = (b.textContent ?? '').trim();
+      return labels.some(l => text === l || text.includes(l));
+    }) ?? null;
+  }
+
+  async function autoInit() {
+    // Let the page do its initial render first
+    await sleep(1200);
+
+    if (config.id === 'deepseek') {
+      // Auto-dismiss the cookie consent modal so it doesn't block input
+      try {
+        const btn = await waitUntil(
+          () => findCookieAcceptButton(),
+          { timeoutMs: 5000, intervalMs: 400 }
+        );
+        if (btn) robustClick(btn);
+      } catch (_) { /* no banner — fine */ }
+    }
+
+    if (config.id === 'gemini') {
+      // Auto-enter temporary chat so the iframe doesn't sit on the home page
+      try { await ensureNewChat(); } catch (_) {}
+    }
+
+    // ChatGPT: starts in temp chat via ?temporary-chat=true URL — nothing to do
+    // Kimi: no banners or special init needed
+  }
+
+  autoInit();
 
   // Exposed for SW-driven polling. SW calls this via chrome.scripting.executeScript
   // every poll tick — that synchronous invocation forces the tab's event loop to
@@ -410,6 +489,9 @@
   }
 
   function setInputValue(input, value) {
+    // In iframe contexts document.hasFocus() may be false without explicit
+    // window.focus(), and that breaks execCommand for Quill (Gemini).
+    try { window.focus(); } catch (_) {}
     input.focus();
 
     if (input instanceof HTMLTextAreaElement || input instanceof HTMLInputElement) {
@@ -421,17 +503,21 @@
       return;
     }
 
-    // contenteditable: try execCommand first — it triggers the
-    // beforeinput→input event chain that Quill / Lexical / ProseMirror
-    // all listen to. Paste events get filtered by Quill specifically.
-    let inserted = false;
-    try {
-      inserted = document.execCommand('insertText', false, value);
-    } catch (_) {}
+    // Whitespace-tolerant: editors normalize newlines into block elements so
+    // the readback will have different whitespace than what we inserted.
+    const wantedKey = value.replace(/\s+/g, '').slice(0, Math.min(20, value.length));
+    const has = () => {
+      const compact = ((input.innerText ?? '') + (input.textContent ?? ''))
+        .replace(/\s+/g, '');
+      return compact.includes(wantedKey);
+    };
 
-    const got = (input.innerText ?? '') + (input.textContent ?? '');
-    if (!inserted || !got.includes(value.slice(0, Math.min(10, value.length)))) {
-      // fallback: paste event (works for some Lexical builds)
+    // 1) execCommand insertText — best for Quill/Lexical/ProseMirror when focused
+    try { document.execCommand('insertText', false, value); } catch (_) {}
+    if (has()) return;
+
+    // 2) Paste event — works for some Lexical builds, less reliable for Quill
+    try {
       const dt = new DataTransfer();
       dt.setData('text/plain', value);
       input.dispatchEvent(new ClipboardEvent('paste', {
@@ -439,7 +525,25 @@
         bubbles: true,
         cancelable: true
       }));
-    }
+    } catch (_) {}
+    if (has()) return;
+
+    // 3) beforeinput event (Quill in iframe-no-focus case often only honors this)
+    try {
+      input.dispatchEvent(new InputEvent('beforeinput', {
+        inputType: 'insertText',
+        data: value,
+        bubbles: true,
+        cancelable: true,
+        composed: true
+      }));
+      input.dispatchEvent(new InputEvent('input', {
+        inputType: 'insertText',
+        data: value,
+        bubbles: true,
+        composed: true
+      }));
+    } catch (_) {}
   }
 
   async function ensureNewChat() {
@@ -486,26 +590,61 @@
     input.dispatchEvent(new KeyboardEvent('keyup', opts));
   }
 
-  async function submitPrompt(prompt) {
+  async function submitPrompt(prompt, skipInput) {
     let input = await waitUntil(
       () => findInput(),
       { timeoutMs: 30000, intervalMs: 300 }
     );
     const beforeCount = getAssistantMessages().length;
 
-    setInputValue(input, prompt);
-    await sleep(300);
+    // Whitespace-tolerant verification. Editors like Lexical/Quill render text
+    // into <p> blocks, so what came in as "原始问题：\nAI..." reads back as
+    // "原始问题：\n\nAI..." via innerText. Strip whitespace from both sides
+    // before comparing so we don't fail-fast on a successful injection.
+    const stripWS = (s) => (s ?? '').replace(/\s+/g, '');
+    const promptCompact = stripWS(prompt);
+    // First ~20 non-whitespace chars are enough to confirm the prompt landed.
+    const wantedKey = promptCompact.slice(0, Math.min(20, promptCompact.length));
+    const readText = (el) => el instanceof HTMLTextAreaElement
+      ? el.value
+      : (el.innerText ?? '');
+    const inputContains = (el) => stripWS(readText(el)).includes(wantedKey);
 
-    // if framework swapped the node out from under us, re-query and retry once
-    const textIn = input instanceof HTMLTextAreaElement
-      ? input.value
-      : input.innerText;
-    if (!textIn || !textIn.includes(prompt.slice(0, Math.min(10, prompt.length)))) {
-      const fresh = findInput();
-      if (fresh && fresh !== input) {
-        input = fresh;
-        setInputValue(input, prompt);
-        await sleep(300);
+    if (!skipInput) {
+      setInputValue(input, prompt);
+      await sleep(300);
+
+      if (!inputContains(input)) {
+        const fresh = findInput();
+        if (fresh && fresh !== input) {
+          input = fresh;
+          setInputValue(input, prompt);
+          await sleep(300);
+        }
+      }
+
+      if (!inputContains(input)) {
+        const inputType = input.tagName + (input instanceof HTMLTextAreaElement ? '/textarea' : '/contenteditable');
+        const readback = readText(input).slice(0, 30).replace(/\s/g, ' ');
+        throw new Error(
+          `Prompt failed to enter input — all 3 methods rejected. ` +
+          `input=${inputType} docFocus=${document.hasFocus()} ` +
+          `wantedKey="${wantedKey.slice(0, 20)}" readback="${readback}"`
+        );
+      }
+    } else {
+      // SW already injected (e.g. via Quill's API for Gemini). Verify presence,
+      // wait briefly if needed for the framework to propagate it.
+      if (!inputContains(input)) {
+        await sleep(400);
+      }
+      if (!inputContains(input)) {
+        const readback = readText(input).slice(0, 30).replace(/\s/g, ' ');
+        throw new Error(
+          `skipInput set but Quill injection didn't take. ` +
+          `docFocus=${document.hasFocus()} ` +
+          `wantedKey="${wantedKey.slice(0, 20)}" readback="${readback}"`
+        );
       }
     }
 
@@ -526,11 +665,20 @@
       pressEnter(input);
     }
 
-    // if submission didn't start, fall back to Enter
-    await sleep(1200);
-    if (getAssistantMessages().length === beforeCount) {
-      pressEnter(input);
-    }
+    // Enter-fallback runs detached. If the click didn't fire submission, this
+    // re-tries with Enter ~1.2s later. Awaiting it here would let SPA-routing
+    // providers (e.g. DeepSeek) tear down the content script mid-await and
+    // close the message channel before sendResponse fires. The fallback
+    // doesn't need to block submitPrompt — the SW-side Phase 3 poll catches
+    // any "no text appeared" case via its 90s first-text timeout anyway.
+    const inputRef = input;
+    setTimeout(() => {
+      try {
+        if (getAssistantMessages().length === beforeCount) {
+          pressEnter(inputRef);
+        }
+      } catch (_) {}
+    }, 1200);
 
     return beforeCount;
   }
@@ -556,8 +704,8 @@
   }
 
   async function waitForGenerationEnd() {
-    const STABLE_MS = 3500;          // primary: UI confirms done + stable
-    const FALLBACK_STABLE_MS = 12000; // fallback: text stable this long → done regardless of UI
+    const STABLE_MS = 5000;          // primary: UI confirms done + stable (was 3500 — too eager on Kimi pauses)
+    const FALLBACK_STABLE_MS = 14000; // fallback: text stable this long → done regardless of UI
     const TIMEOUT_MS = 300000;
     const POLL_MS = 500;
 
@@ -608,10 +756,15 @@
   // Phase 2 (no focus needed): poll until text stabilizes.
   let pendingPhase2 = null;
 
-  async function submitAndWaitStart(prompt) {
-    const beforeCount = await submitPrompt(prompt);
-    await waitForGenerationStart(beforeCount);
-    pendingPhase2 = { active: true };
+  async function submitAndWaitStart(prompt, skipInput) {
+    // "Fire and return" — only await submitPrompt (which inserts text + clicks
+    // send + verifies input). DON'T await waitForGenerationStart here:
+    // providers like DeepSeek do SPA nav immediately on send, which kills the
+    // content script mid-await and closes the message channel before
+    // sendResponse fires. Phase 3 (SW-side pollFrameUntilStable) catches
+    // "submission silently failed" via its 90s first-text timeout.
+    const beforeCount = await submitPrompt(prompt, skipInput);
+    pendingPhase2 = { active: true, beforeCount };
   }
 
   async function waitForOutput() {
@@ -643,7 +796,7 @@
       return true;
     }
     if (msg.type === 'SUBMIT_AND_WAIT_START') {
-      submitAndWaitStart(msg.prompt)
+      submitAndWaitStart(msg.prompt, msg.skipInput)
         .then(() => sendResponse({ ok: true }))
         .catch(err => sendResponse({ ok: false, error: err.message ?? String(err) }));
       return true;
@@ -654,6 +807,16 @@
         .catch(err => sendResponse({ ok: false, error: err.message ?? String(err) }));
       return true;
     }
+    if (msg.type === 'RESET_TO_START' && typeof msg.url === 'string') {
+      // SW asks us to navigate to the start URL for a fresh chat.
+      // Defer so sendResponse can fire before the channel closes due to nav.
+      sendResponse({ ok: true });
+      setTimeout(() => {
+        try { window.location.replace(msg.url); }
+        catch (_) { window.location.href = msg.url; }
+      }, 50);
+      return false;
+    }
     if (msg.type === 'PROBE_STATE') {
       try {
         sendResponse({ ok: true, state: probeState() });
@@ -661,6 +824,19 @@
         sendResponse({ ok: false, error: err.message ?? String(err) });
       }
       return;
+    }
+    if (msg.type === 'REREGISTER') {
+      // SW restarted and lost frame map — re-announce ourselves so
+      // providerFrames repopulates without reloading the iframe.
+      try {
+        chrome.runtime.sendMessage({
+          type: 'CONTENT_SCRIPT_REGISTER',
+          provider: config.id,
+          inIframe
+        }).catch(() => {});
+      } catch (_) {}
+      sendResponse({ ok: true, provider: config.id });
+      return false;
     }
   });
 

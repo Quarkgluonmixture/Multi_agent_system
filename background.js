@@ -31,6 +31,355 @@ function pickFinalEditor(enabled) {
 
 const ourTabs = new Map();
 
+// =================== Grid (iframe) mode registry ===================
+//
+// In the new iframe-based architecture, all 4 AI sites run as iframes inside
+// a single grid.html tab. Each iframe's content script registers itself on
+// load via CONTENT_SCRIPT_REGISTER, so SW can map provider → frameId for
+// targeted message dispatch.
+
+let gridTabId = null;
+// providerFrames: tabId → { provider → frameId }
+const providerFrames = new Map();
+
+async function getOrCreateGridTab() {
+  if (gridTabId) {
+    try {
+      const tab = await chrome.tabs.get(gridTabId);
+      if (tab) return gridTabId;
+    } catch (_) {
+      gridTabId = null;
+      providerFrames.delete(gridTabId);
+    }
+  }
+  const url = chrome.runtime.getURL('grid.html');
+  const tab = await chrome.tabs.create({ url, active: false });
+  gridTabId = tab.id;
+  schedulePersistDebug();
+  return gridTabId;
+}
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (tabId === gridTabId) {
+    gridTabId = null;
+  }
+  providerFrames.delete(tabId);
+});
+
+function swSleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function swWaitUntil(predicate, { timeoutMs, intervalMs }) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (await predicate()) return true;
+    await swSleep(intervalMs);
+  }
+  throw new Error('swWaitUntil timeout');
+}
+
+function getFrameId(tabId, provider) {
+  return providerFrames.get(tabId)?.[provider];
+}
+
+async function ensureGridReady(expectedProviders) {
+  const tabId = await getOrCreateGridTab();
+  await swWaitUntil(() => {
+    const map = providerFrames.get(tabId) ?? {};
+    return expectedProviders.every(p => map[p] != null);
+  }, { timeoutMs: 30000, intervalMs: 500 });
+  return tabId;
+}
+
+// Reset an iframe to its provider's start URL for a fresh chat.
+// We can't executeScript on the chrome-extension:// top frame, and runtime
+// broadcasts are flaky from SW. So we tell the iframe's own content script
+// to navigate itself — chrome.tabs.sendMessage(tabId, msg, { frameId })
+// reaches content scripts directly regardless of origin.
+async function reloadProviderFrame(gridTabId, provider) {
+  const map = providerFrames.get(gridTabId);
+  const oldFrameId = map?.[provider];
+
+  if (oldFrameId == null) {
+    // No prior frame — wait for initial registration only
+    await swWaitUntil(
+      () => providerFrames.get(gridTabId)?.[provider] != null,
+      { timeoutMs: 30000, intervalMs: 500 }
+    );
+    await swSleep(1500);
+    return;
+  }
+
+  if (map) delete map[provider];
+
+  const startUrl = PROVIDERS[provider]?.startUrl;
+  if (!startUrl) throw new Error(`Unknown provider ${provider}`);
+
+  try {
+    await chrome.tabs.sendMessage(
+      gridTabId,
+      { type: 'RESET_TO_START', url: startUrl },
+      { frameId: oldFrameId }
+    );
+  } catch (err) {
+    // Navigation kills the message channel — expected, ignore that specific case
+    const msg = String(err?.message ?? '');
+    if (!msg.includes('message channel closed') &&
+        !msg.includes('Receiving end does not exist')) {
+      throw new Error(`reset iframe failed: ${msg}`);
+    }
+  }
+
+  await swWaitUntil(
+    () => providerFrames.get(gridTabId)?.[provider] != null,
+    { timeoutMs: 30000, intervalMs: 500 }
+  );
+
+  // Wait until the iframe's input is actually present + autoInit has settled.
+  // Probe the iframe state via PROBE_STATE; consider it "ready" when input is
+  // found AND the page settled (visibility=visible, no in-flight banners).
+  // Fall back to a short sleep if probing keeps failing.
+  const newFrameId = providerFrames.get(gridTabId)?.[provider];
+  let ready = false;
+  for (let i = 0; i < 24 && !ready; i++) { // up to 12s
+    try {
+      const r = await chrome.tabs.sendMessage(
+        gridTabId,
+        { type: 'PROBE_STATE' },
+        { frameId: newFrameId }
+      );
+      if (r?.ok && r.state?.input) {
+        ready = true;
+        break;
+      }
+    } catch (_) {}
+    await swSleep(500);
+  }
+  if (!ready) await swSleep(1500);
+}
+
+// Gemini-specific: inject prompt by directly calling Quill's API in the
+// iframe's main world. This bypasses the focus / execCommand requirement
+// that fails for Quill in iframes. Retries because Quill may not be
+// attached yet right after iframe reload + autoInit clicks.
+async function injectGeminiPromptViaQuill(gridTabId, frameId, text) {
+  const MAX_ATTEMPTS = 8;
+  const RETRY_DELAY_MS = 500;
+  let lastErr = 'unknown';
+
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    const r = await tryInjectQuillOnce(gridTabId, frameId, text);
+    if (r?.ok) return r;
+    lastErr = r?.error ?? 'no result';
+    await swSleep(RETRY_DELAY_MS);
+  }
+  return { ok: false, error: `Quill not ready after ${MAX_ATTEMPTS} attempts: ${lastErr}` };
+}
+
+async function tryInjectQuillOnce(gridTabId, frameId, text) {
+  try {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId: gridTabId, frameIds: [frameId] },
+      world: 'MAIN',
+      func: (txt) => {
+        // Find Quill instance — try multiple known patterns
+        const findQuill = () => {
+          // 1. Global Quill.find()
+          if (window.Quill && window.Quill.find) {
+            const ed = document.querySelector('.ql-editor');
+            if (ed) {
+              const q = window.Quill.find(ed);
+              if (q) return q;
+            }
+          }
+          // 2. Walk up from .ql-editor checking for instance properties
+          const editor = document.querySelector('.ql-editor');
+          if (editor) {
+            let node = editor;
+            for (let i = 0; i < 6 && node; i++) {
+              for (const key of ['__quill', '_quill', 'quill']) {
+                if (node[key] && typeof node[key].insertText === 'function') {
+                  return node[key];
+                }
+              }
+              node = node.parentElement;
+            }
+          }
+          // 3. Check rich-textarea web component
+          const rt = document.querySelector('rich-textarea');
+          if (rt) {
+            for (const key of ['__quill', '_quill', 'quill', '_editor', 'editor']) {
+              const obj = rt[key];
+              if (obj && typeof obj.insertText === 'function') return obj;
+              if (obj && obj._quill && typeof obj._quill.insertText === 'function') return obj._quill;
+              if (obj && obj.__quill && typeof obj.__quill.insertText === 'function') return obj.__quill;
+            }
+          }
+          return null;
+        };
+
+        const quill = findQuill();
+        if (!quill) return { ok: false, error: 'no Quill instance found' };
+
+        try {
+          if (typeof quill.setText === 'function') {
+            quill.setText(txt + '\n');
+            return { ok: true, method: 'setText' };
+          }
+          if (typeof quill.insertText === 'function') {
+            quill.insertText(0, txt);
+            return { ok: true, method: 'insertText' };
+          }
+        } catch (err) {
+          return { ok: false, error: err.message ?? String(err) };
+        }
+        return { ok: false, error: 'no setText/insertText method' };
+      },
+      args: [text]
+    });
+    return res?.result ?? { ok: false, error: 'no result from executeScript' };
+  } catch (err) {
+    return { ok: false, error: err.message ?? String(err) };
+  }
+}
+
+// Poll a single iframe for stable text output (replacement for tab-based pollUntilStable)
+async function pollFrameUntilStable(gridTabId, frameId, signal, onPartial) {
+  // 5s instead of 3s. 3s gave false-positive "done" when a provider paused
+  // mid-stream for tool-use, fetch, or just a slow chunk — we'd capture a
+  // sentence-fragment as final R2 output and kick off Final on it.
+  const STABLE_MS = 5000;
+  const FALLBACK_STABLE_MS = 12000;
+  const TIMEOUT_MS = 300000;
+  const POLL_MS = 500;
+  const FIRST_TEXT_TIMEOUT_MS = 90000;
+
+  let lastText = '';
+  let lastChangedAt = Date.now();
+  const start = Date.now();
+  let consecutiveFails = 0;
+
+  while (Date.now() - start < TIMEOUT_MS) {
+    if (signal?.aborted) throw new Error('Pipeline cancelled');
+
+    let state = null;
+    try {
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId: gridTabId, frameIds: [frameId] },
+        func: () => (typeof window.__multiAIPollState === 'function')
+          ? window.__multiAIPollState()
+          : null
+      });
+      state = res?.result ?? null;
+      consecutiveFails = 0;
+    } catch (err) {
+      consecutiveFails++;
+      if (consecutiveFails >= 5) {
+        throw new Error(`Probe failed: ${err.message ?? String(err)}`);
+      }
+    }
+
+    if (state && typeof state.text === 'string') {
+      if (state.text !== lastText) {
+        lastText = state.text;
+        lastChangedAt = Date.now();
+        if (typeof onPartial === 'function' && state.text) {
+          try { onPartial(state.text); } catch (_) {}
+        }
+      }
+      const stableFor = Date.now() - lastChangedAt;
+      const elapsed = Date.now() - start;
+
+      if (state.text && !state.stopVisible && !state.streaming && stableFor >= STABLE_MS) {
+        return state.text;
+      }
+      if (state.text && stableFor >= FALLBACK_STABLE_MS) {
+        return state.text;
+      }
+      if (!state.text && elapsed > FIRST_TEXT_TIMEOUT_MS) {
+        throw new Error('No assistant text appeared within 90s');
+      }
+    }
+
+    await swSleep(POLL_MS);
+  }
+  throw new Error('Generation did not complete within 5 minutes');
+}
+
+// Dedicated window for AI tabs. User's main window stays focused except
+// for the brief Phase 2 submit window where execCommand needs focus.
+let aiWindowId = null;
+
+(async () => {
+  // Recover dedicated window id across SW restarts (session storage survives
+  // SW termination but not browser restart, which is exactly what we want).
+  try {
+    const stored = await chrome.storage.session.get('aiWindowId');
+    if (stored.aiWindowId) {
+      try {
+        await chrome.windows.get(stored.aiWindowId);
+        aiWindowId = stored.aiWindowId;
+      } catch (_) {
+        await chrome.storage.session.remove('aiWindowId');
+      }
+    }
+  } catch (_) {}
+})();
+
+// In-flight promise to deduplicate concurrent creation attempts.
+// Without this, parallel Phase 1 callers each see aiWindowId===null and
+// each create their own new window → 4 orphan about:blank windows.
+let aiWindowCreationInFlight = null;
+
+async function getOrCreateAIWindow() {
+  if (aiWindowId) {
+    try {
+      await chrome.windows.get(aiWindowId);
+      return aiWindowId;
+    } catch (_) {
+      aiWindowId = null;
+    }
+  }
+
+  if (aiWindowCreationInFlight) {
+    return aiWindowCreationInFlight;
+  }
+
+  aiWindowCreationInFlight = (async () => {
+    try {
+      const win = await chrome.windows.create({
+        url: 'about:blank',
+        focused: false,
+        type: 'normal',
+        width: 1000,
+        height: 800,
+        state: 'normal'
+      });
+      aiWindowId = win.id;
+      try { await chrome.storage.session.set({ aiWindowId }); } catch (_) {}
+      // Close the about:blank placeholder once real tabs have likely been
+      // created. Keep around briefly in case window-with-zero-tabs would close.
+      setTimeout(() => {
+        if (aiWindowId === win.id && win.tabs?.[0]?.id) {
+          chrome.tabs.remove(win.tabs[0].id).catch(() => {});
+        }
+      }, 8000);
+      return aiWindowId;
+    } finally {
+      aiWindowCreationInFlight = null;
+    }
+  })();
+
+  return aiWindowCreationInFlight;
+}
+
+chrome.windows.onRemoved.addListener((closedId) => {
+  if (closedId === aiWindowId) {
+    aiWindowId = null;
+    ourTabs.clear();
+    chrome.storage.session.remove('aiWindowId').catch(() => {});
+  }
+});
+
 const MAX_ERRORS = 50;
 const debugState = {
   errors: [],
@@ -38,6 +387,64 @@ const debugState = {
   lastStages: {},
   lastResults: {}
 };
+
+// Persist debug state across SW restarts — chrome.storage.session survives
+// SW idle termination but not browser restart. Without this, debug bundles
+// captured after a long pipeline run come back empty.
+const DEBUG_STORE_KEY = 'debugState';
+
+(async () => {
+  try {
+    const { [DEBUG_STORE_KEY]: stored } = await chrome.storage.session.get(DEBUG_STORE_KEY);
+    if (stored) {
+      if (Array.isArray(stored.errors)) debugState.errors = stored.errors;
+      if (stored.lastStages) debugState.lastStages = stored.lastStages;
+      if (stored.lastResults) debugState.lastResults = stored.lastResults;
+    }
+  } catch (_) {}
+  // Rehydrate gridTabId in case SW restarted but the grid tab is still open.
+  await rehydrateGridState().catch(() => {});
+})();
+
+// SW idle-terminates and loses in-memory state; the grid tab and its iframes
+// are still alive in the browser, but providerFrames is empty until iframes
+// re-register. We restore gridTabId from storage and ask iframes to
+// re-announce themselves.
+async function rehydrateGridState() {
+  if (gridTabId) return;
+  let candId = null;
+  try {
+    const { [DEBUG_STORE_KEY]: stored } = await chrome.storage.session.get(DEBUG_STORE_KEY);
+    candId = stored?.gridTabIdSnapshot ?? null;
+  } catch (_) { return; }
+  if (!candId) return;
+  try {
+    const tab = await chrome.tabs.get(candId);
+    const expectedPrefix = chrome.runtime.getURL('grid.html');
+    if (!tab?.url || !tab.url.startsWith(expectedPrefix)) return;
+    gridTabId = candId;
+  } catch (_) { return; }
+  // Ping all frames to re-register. Errors are expected for frames that
+  // don't have the content script (e.g. nested provider sub-iframes).
+  try {
+    await chrome.tabs.sendMessage(candId, { type: 'REREGISTER' });
+  } catch (_) {}
+  // Give registrations a moment to land before any caller reads providerFrames.
+  await swSleep(300);
+}
+
+function schedulePersistDebug() {
+  // No debounce — write immediately. SW lifecycle respects pending storage
+  // ops, so calling without await still completes before SW idle-terminates.
+  try {
+    chrome.storage.session.set({ [DEBUG_STORE_KEY]: {
+      errors: debugState.errors,
+      lastStages: debugState.lastStages,
+      lastResults: debugState.lastResults,
+      gridTabIdSnapshot: gridTabId
+    }}).catch(() => {});
+  } catch (_) {}
+}
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -49,6 +456,7 @@ function pushError(provider, stage, message) {
     message: String(message ?? '')
   });
   if (debugState.errors.length > MAX_ERRORS) debugState.errors.shift();
+  schedulePersistDebug();
 }
 
 self.addEventListener('error', (e) => {
@@ -63,6 +471,7 @@ function postProvider(provider, stage, payload) {
   if (payload.stage) debugState.lastStages[key] = payload.stage;
   if (payload.status === 'done' || payload.status === 'failed') {
     debugState.lastResults[key] = { ...payload };
+    schedulePersistDebug();
   }
   if (payload.status === 'failed' && payload.error) {
     pushError(provider, `${stage}/${debugState.lastStages[key] ?? '?'}`, payload.error);
@@ -73,14 +482,51 @@ function postProvider(provider, stage, payload) {
 }
 
 async function collectDebug() {
+  // SW may have just woken up — rehydrate gridTabId + ping iframes to
+  // re-register before reading state.
+  await rehydrateGridState().catch(() => {});
+
   const out = {
     timestamp: new Date().toISOString(),
     extension: chrome.runtime.getManifest()?.version ?? '?',
     userAgent: (typeof navigator !== 'undefined' && navigator.userAgent) || '?',
     knownTabs: {},
     errors: [...debugState.errors].reverse(),
-    providerStates: {}
+    providerStates: {},
+    grid: {
+      gridTabId: gridTabId ?? null,
+      providerFrames: gridTabId ? (providerFrames.get(gridTabId) ?? {}) : {},
+      gridTabUrl: null,
+      gridTabStatus: null
+    }
   };
+
+  if (gridTabId) {
+    try {
+      const tab = await chrome.tabs.get(gridTabId);
+      out.grid.gridTabUrl = tab.url;
+      out.grid.gridTabStatus = tab.status;
+      out.grid.gridTabActive = tab.active;
+    } catch (err) {
+      out.grid.error = err.message;
+    }
+
+    // Probe each iframe via tabs.sendMessage to its content script
+    // (content_adapter.js has a PROBE_STATE handler that returns rich state).
+    const frames = providerFrames.get(gridTabId) ?? {};
+    for (const [provider, frameId] of Object.entries(frames)) {
+      try {
+        const r = await chrome.tabs.sendMessage(
+          gridTabId,
+          { type: 'PROBE_STATE' },
+          { frameId }
+        );
+        out.grid['probe_' + provider] = r?.state ?? { error: r?.error ?? 'no state' };
+      } catch (err) {
+        out.grid['probe_' + provider] = { error: err.message ?? String(err) };
+      }
+    }
+  }
 
   const stages = ['r1', 'r2', 'final'];
   for (const provider of ALL_PROVIDERS) {
@@ -170,7 +616,8 @@ async function navigateTabAndWait(tabId, url, active) {
   });
 }
 
-function createTabAndWait(url, active) {
+async function createTabAndWait(url, active) {
+  const winId = await getOrCreateAIWindow();
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       chrome.tabs.onUpdated.removeListener(listener);
@@ -185,7 +632,7 @@ function createTabAndWait(url, active) {
       }
     };
     chrome.tabs.onUpdated.addListener(listener);
-    chrome.tabs.create({ url, active })
+    chrome.tabs.create({ url, active, windowId: winId })
       .then(tab => {
         if (!tab.id) {
           clearTimeout(timeout);
@@ -370,8 +817,15 @@ async function runSingle(provider, prompt, stage, signal, onPartial) {
   const startedAt = Date.now();
   postProvider(provider, stage, { status: 'running', stage: 'opening tab' });
 
+  // Remember user window so we can return focus after the brief submit
+  let userWindowId = null;
   try {
-    const tabId = await prepareProviderTab(provider, true);
+    const focused = await chrome.windows.getLastFocused({ populate: false });
+    if (focused && focused.id !== aiWindowId) userWindowId = focused.id;
+  } catch (_) {}
+
+  try {
+    const tabId = await prepareProviderTab(provider, false);
     postProvider(provider, stage, { status: 'running', stage: 'connecting' });
     await pingContentScript(tabId);
 
@@ -380,8 +834,10 @@ async function runSingle(provider, prompt, stage, signal, onPartial) {
 
     if (signal?.aborted) throw new Error('Pipeline cancelled');
 
-    // Two-phase submit + SW polling, same path as parallel — so single mode
-    // can stream partials too.
+    // Focus AI window so tab isn't throttled-as-hidden during work
+    if (aiWindowId) {
+      try { await chrome.windows.update(aiWindowId, { focused: true }); } catch (_) {}
+    }
     await activateAndSubmit(tabId, provider, prompt, stage);
 
     const text = await pollUntilStable(tabId, provider, signal, onPartial);
@@ -400,10 +856,13 @@ async function runSingle(provider, prompt, stage, signal, onPartial) {
 // =================== Parallel path ===================
 
 async function runParallel(providers, prompts, stage, signal, onPartial) {
-  let originalTabId = null;
+  // Remember the user's currently-focused window so we can return focus to it
+  // after the brief Phase 2 submit window. Phase 3 keepalive cycles tabs in
+  // the AI window without ever stealing focus from this one.
+  let userWindowId = null;
   try {
-    const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    originalTabId = activeTab?.id ?? null;
+    const focused = await chrome.windows.getLastFocused({ populate: false });
+    if (focused && focused.id !== aiWindowId) userWindowId = focused.id;
   } catch (_) {}
 
   const startedAt = Date.now();
@@ -420,7 +879,15 @@ async function runParallel(providers, prompts, stage, signal, onPartial) {
     }
   }));
 
-  // Phase 2: serial submit (each tab activated briefly for execCommand to work)
+  // Focus AI window for the entire stage. Chromium throttles tabs in
+  // unfocused windows as if they were hidden — render schedulers, framework
+  // re-renders, SSE→DOM all stall — which is why DS R2 submitting got
+  // stuck previously. Tabs need their window focused to operate normally.
+  if (aiWindowId) {
+    try { await chrome.windows.update(aiWindowId, { focused: true }); } catch (_) {}
+  }
+
+  // Phase 2: serial submit
   for (const p of providers) {
     if (failed.has(p)) continue;
     if (signal?.aborted) {
@@ -435,16 +902,11 @@ async function runParallel(providers, prompts, stage, signal, onPartial) {
     }
   }
 
-  if (signal?.aborted) {
-    if (originalTabId) chrome.tabs.update(originalTabId, { active: true }).catch(() => {});
-    throw new Error('Pipeline cancelled');
-  }
+  if (signal?.aborted) throw new Error('Pipeline cancelled');
 
-  // Don't restore the user's tab between phase 2 and phase 3 — phase 3
-  // rotation would immediately steal it again, causing an extra unwanted blip.
-  // We restore once after phase 3 fully completes.
-
-  // Phase 3: parallel wait + rotating keepalive
+  // Phase 3: parallel wait + rotating keepalive. Tabs cycle within the AI
+  // window (no focus stealing) but stay "visible in their window" so the
+  // framework re-renders aren't throttled.
   const pending = new Set(providers.filter(p => !failed.has(p)));
   const keepalive = startKeepalive(pending, tabIds);
 
@@ -467,10 +929,6 @@ async function runParallel(providers, prompts, stage, signal, onPartial) {
   }));
 
   clearInterval(keepalive);
-  if (originalTabId) {
-    chrome.tabs.update(originalTabId, { active: true }).catch(() => {});
-  }
-
   return results;
 }
 
@@ -508,22 +966,120 @@ async function runStage({ providers, prompts, stage, signal }) {
     postProvider(p, stage, { status: 'running', stage: 'queued' });
   }
 
-  // Stream partial outputs to UI only for the Final stage. R1/R2 are parallel
-  // (3 providers) so streaming text into a single bubble doesn't make sense,
-  // and they go into the collapsed details section anyway.
   const onPartial = stage === 'final'
     ? (provider, partial) => postProvider(provider, stage, {
         status: 'running', stage: 'generating', partialOutput: partial
       })
     : null;
 
-  if (providers.length === 1) {
-    const onPartialSingle = onPartial
-      ? (partial) => onPartial(providers[0], partial)
-      : null;
-    return [await runSingle(providers[0], prompts[providers[0]], stage, signal, onPartialSingle)];
+  // Iframe-based pipeline:
+  //   Phase 1 (reload + autoInit ready): parallel — independent
+  //   Phase 2 (focus + submit): SERIAL — only one iframe can have focus at
+  //                             a time, so contenteditable providers must
+  //                             take turns (otherwise click-send races
+  //                             against the next provider's focus steal)
+  //   Phase 3 (wait for stable text): parallel — no focus needed here
+  const gridTabId = await ensureGridReady(providers);
+
+  const startedAt = Date.now();
+  const startTimes = {};
+  const failed = new Set();
+
+  // ----- Phase 1: parallel reload -----
+  await Promise.all(providers.map(async (provider) => {
+    startTimes[provider] = Date.now();
+    try {
+      postProvider(provider, stage, { status: 'running', stage: 'preparing' });
+      await reloadProviderFrame(gridTabId, provider);
+    } catch (err) {
+      failed.add(provider);
+      postProvider(provider, stage, { status: 'failed', error: err?.message ?? String(err) });
+    }
+  }));
+
+  if (signal?.aborted) throw new Error('Pipeline cancelled');
+
+  // ----- Phase 2: serial submit (focus + inject + click + wait first token) -----
+  for (const provider of providers) {
+    if (failed.has(provider)) continue;
+    if (signal?.aborted) {
+      failed.add(provider);
+      continue;
+    }
+
+    try {
+      const frameId = getFrameId(gridTabId, provider);
+      if (frameId == null) throw new Error(`No frameId for ${provider}`);
+
+      postProvider(provider, stage, { status: 'running', stage: 'submitting' });
+
+      // Focus this iframe — exclusive focus since we serialized
+      try {
+        await chrome.runtime.sendMessage({ type: 'FOCUS_IFRAME', provider });
+      } catch (_) {}
+      // Give the focus chain a real moment to settle. iframe.focus() is
+      // async-ish under the hood and 200ms isn't enough on slower machines.
+      await swSleep(600);
+
+      // Verify focus actually took (programmatic focus without user gesture
+      // may be a no-op). If not focused, retry with mouse-click simulation.
+      try {
+        const [check] = await chrome.scripting.executeScript({
+          target: { tabId: gridTabId, frameIds: [frameId] },
+          func: () => ({ hasFocus: document.hasFocus(), vis: document.visibilityState })
+        });
+        if (!check?.result?.hasFocus) {
+          // Try a more aggressive focus attempt via mouse-event simulation in grid
+          try {
+            await chrome.runtime.sendMessage({ type: 'FOCUS_IFRAME_AGGRESSIVE', provider });
+          } catch (_) {}
+          await swSleep(400);
+        }
+      } catch (_) {}
+
+      // Gemini Quill API hijack (focus-independent, retried internally)
+      let skipInput = false;
+      if (provider === 'gemini') {
+        const r = await injectGeminiPromptViaQuill(gridTabId, frameId, prompts[provider]);
+        if (r?.ok) skipInput = true;
+      }
+
+      const submitResp = await chrome.tabs.sendMessage(
+        gridTabId,
+        { type: 'SUBMIT_AND_WAIT_START', prompt: prompts[provider], skipInput },
+        { frameId }
+      );
+      if (!submitResp?.ok) throw new Error(submitResp?.error ?? 'submit failed');
+
+      postProvider(provider, stage, { status: 'running', stage: 'generating' });
+    } catch (err) {
+      failed.add(provider);
+      postProvider(provider, stage, { status: 'failed', error: err?.message ?? String(err) });
+    }
   }
-  return await runParallel(providers, prompts, stage, signal, onPartial);
+
+  if (signal?.aborted) throw new Error('Pipeline cancelled');
+
+  // ----- Phase 3: parallel poll for stable text -----
+  return await Promise.all(providers.map(async (provider) => {
+    if (failed.has(provider)) {
+      return { provider, ok: false, error: 'failed in earlier phase' };
+    }
+    try {
+      const frameId = getFrameId(gridTabId, provider);
+      const onPartialThis = onPartial ? (p) => onPartial(provider, p) : null;
+      const text = await pollFrameUntilStable(gridTabId, frameId, signal, onPartialThis);
+      if (!text) throw new Error('Empty output');
+
+      const elapsedMs = Date.now() - (startTimes[provider] ?? startedAt);
+      postProvider(provider, stage, { status: 'done', output: text, elapsedMs });
+      return { provider, ok: true, output: text, elapsedMs };
+    } catch (err) {
+      const error = err?.message ?? String(err);
+      postProvider(provider, stage, { status: 'failed', error });
+      return { provider, ok: false, error };
+    }
+  }));
 }
 
 // =================== Prompt templates ===================
@@ -838,16 +1394,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     activePipelineAbort = new AbortController();
     const signal = activePipelineAbort.signal;
 
-    runFullPipeline(msg.prompt, msg.history ?? [], msg.providers, msg.finalEditor, msg.roleMapping, signal)
-      .then(data => sendResponse({ ok: true, ...data }))
-      .catch(err => {
+    (async () => {
+      // Capture user's current window so we can return focus when done
+      let userWindowId = null;
+      try {
+        const focused = await chrome.windows.getLastFocused();
+        if (focused && focused.id !== aiWindowId) userWindowId = focused.id;
+      } catch (_) {}
+
+      try {
+        const data = await runFullPipeline(
+          msg.prompt, msg.history ?? [], msg.providers,
+          msg.finalEditor, msg.roleMapping, signal
+        );
+        sendResponse({ ok: true, ...data });
+      } catch (err) {
         const cancelled = signal.aborted || err.message === 'Pipeline cancelled';
         sendResponse({ ok: false, error: err.message ?? String(err), cancelled });
-      })
-      .finally(() => {
+      } finally {
         if (activePipelineAbort?.signal === signal) activePipelineAbort = null;
+        // Hand focus back to the user's main window
+        if (userWindowId) {
+          chrome.windows.update(userWindowId, { focused: true }).catch(() => {});
+        }
         closeAllProviderTabs();
-      });
+      }
+    })();
     return true;
   }
   if (msg.type === 'CANCEL_PIPELINE') {
@@ -856,6 +1428,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({ ok: true });
     } else {
       sendResponse({ ok: false, error: 'No active pipeline' });
+    }
+    return false;
+  }
+  if (msg.type === 'OPEN_GRID') {
+    getOrCreateGridTab()
+      .then(tabId => chrome.tabs.update(tabId, { active: true }))
+      .then(() => sendResponse({ ok: true, gridTabId }))
+      .catch(err => sendResponse({ ok: false, error: err.message ?? String(err) }));
+    return true;
+  }
+  if (msg.type === 'GRID_STATUS') {
+    const map = providerFrames.get(gridTabId) ?? {};
+    sendResponse({ ok: true, gridTabId, frames: map });
+    return false;
+  }
+  if (msg.type === 'CONTENT_SCRIPT_REGISTER') {
+    const tabId = sender.tab?.id;
+    const frameId = sender.frameId;
+    if (tabId != null && frameId != null && msg.provider) {
+      let map = providerFrames.get(tabId);
+      if (!map) { map = {}; providerFrames.set(tabId, map); }
+      map[msg.provider] = frameId;
     }
     return false;
   }

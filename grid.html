@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>Multi AI · Grid</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; padding: 0; height: 100vh;
+      background: #18181b; color: #e5e5e5;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      overflow: hidden;
+    }
+    body { display: flex; flex-direction: column; }
+    .header {
+      flex-shrink: 0;
+      padding: 6px 12px;
+      background: #232327;
+      border-bottom: 1px solid #3a3a3e;
+      font-size: 12px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .header .title { font-weight: 600; font-size: 13px; }
+    .header .hint { color: #888; font-size: 11px; flex: 1; }
+    .grid {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      grid-template-rows: 1fr 1fr;
+      gap: 3px;
+      padding: 3px;
+      min-height: 0;
+    }
+    .cell {
+      display: flex;
+      flex-direction: column;
+      background: #0a0a0a;
+      border: 1px solid #3a3a3e;
+      overflow: hidden;
+      min-height: 0;
+      position: relative;
+    }
+    .cell-head {
+      flex-shrink: 0;
+      padding: 4px 8px;
+      background: #2a2a2e;
+      font-size: 11px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .cell-head .name { font-weight: 600; }
+    .cell-head .role { font-size: 10px; color: #888; margin-left: 6px; }
+    iframe {
+      flex: 1;
+      width: 100%;
+      border: none;
+      background: white;
+      min-height: 0;
+    }
+    .cell[data-provider="chatgpt"]  { border-left: 3px solid #10a37f; }
+    .cell[data-provider="gemini"]   { border-left: 3px solid #4285f4; }
+    .cell[data-provider="deepseek"] { border-left: 3px solid #6366f1; }
+    .cell[data-provider="kimi"]     { border-left: 3px solid #a855f7; }
+    button.action {
+      background: transparent;
+      border: 1px solid #555;
+      color: #ccc;
+      font-size: 10px;
+      padding: 1px 6px;
+      border-radius: 2px;
+      cursor: pointer;
+    }
+    button.action:hover { background: #333; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <span class="title">Multi AI · Grid</span>
+    <span class="hint">这一页让 4 家 AI 在 iframe 里并行响应。保持本页可见（在前台 tab）以避免节流。</span>
+    <button class="action" id="reload-all">全部重载</button>
+  </div>
+  <div class="grid">
+    <div class="cell" data-provider="chatgpt">
+      <div class="cell-head">
+        <span class="name">ChatGPT <span class="role">杠精</span></span>
+        <button class="action" data-target="cg">重载</button>
+      </div>
+      <iframe id="cg" data-provider="chatgpt" src="https://chatgpt.com/?temporary-chat=true"></iframe>
+    </div>
+    <div class="cell" data-provider="gemini">
+      <div class="cell-head">
+        <span class="name">Gemini <span class="role">串子</span></span>
+        <button class="action" data-target="g">重载</button>
+      </div>
+      <iframe id="g" data-provider="gemini" src="https://gemini.google.com/app"></iframe>
+    </div>
+    <div class="cell" data-provider="deepseek">
+      <div class="cell-head">
+        <span class="name">DeepSeek <span class="role">懂王</span></span>
+        <button class="action" data-target="ds">重载</button>
+      </div>
+      <iframe id="ds" data-provider="deepseek" src="https://chat.deepseek.com/"></iframe>
+    </div>
+    <div class="cell" data-provider="kimi">
+      <div class="cell-head">
+        <span class="name">Kimi <span class="role">打工人</span></span>
+        <button class="action" data-target="km">重载</button>
+      </div>
+      <iframe id="km" data-provider="kimi" src="https://www.kimi.com/"></iframe>
+    </div>
+  </div>
+
+  <script src="grid.js"></script>
+</body>
+</html>

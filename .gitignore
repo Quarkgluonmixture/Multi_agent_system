@@ -20,3 +20,12 @@ dist/
 node_modules/
 *.zip
 *.crx
+
+# Chrome extension auto-generated metadata (recreated on extension load)
+_metadata/
+
+# Scratch / POC files
+iframe-poc.html
+
+# Pasted screenshots
+image*.png

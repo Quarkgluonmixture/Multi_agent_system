@@ -1,9 +1,16 @@
 {
   "manifest_version": 3,
-  "name": "Multi AI Chat (v0.20)",
-  "version": "0.0.20",
+  "name": "Multi AI Chat (v0.27)",
+  "version": "0.0.27",
   "description": "Multi-turn chat that runs every message through a 3-round multi-AI deliberation.",
-  "permissions": ["tabs", "sidePanel", "scripting", "storage"],
+  "permissions": ["tabs", "sidePanel", "scripting", "storage", "declarativeNetRequest"],
+  "declarative_net_request": {
+    "rule_resources": [{
+      "id": "ai_iframe_rules",
+      "enabled": true,
+      "path": "iframe_rules.json"
+    }]
+  },
   "host_permissions": [
     "https://chatgpt.com/*",
     "https://chat.openai.com/*",
@@ -33,7 +40,8 @@
         "https://kimi.com/*"
       ],
       "js": ["content_adapter.js"],
-      "run_at": "document_idle"
+      "run_at": "document_idle",
+      "all_frames": true
     }
   ]
 }

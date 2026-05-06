@@ -803,6 +803,35 @@ clearBtn.addEventListener('click', async () => {
 
 copyDebugBtn.addEventListener('click', copyDebug);
 
+// =================== v0.22 Grid PoC ===================
+
+const openGridBtn = document.getElementById('open-grid-btn');
+openGridBtn?.addEventListener('click', async () => {
+  openGridBtn.disabled = true;
+  openGridBtn.textContent = 'Opening...';
+  try {
+    await chrome.runtime.sendMessage({ type: 'OPEN_GRID' });
+    // give iframes time to load + register
+    await new Promise(r => setTimeout(r, 4000));
+    const status = await chrome.runtime.sendMessage({ type: 'GRID_STATUS' });
+    const frames = status?.frames ?? {};
+    const found = Object.keys(frames);
+    const expected = ['chatgpt', 'gemini', 'deepseek', 'kimi'];
+    const missing = expected.filter(p => !found.includes(p));
+    if (missing.length === 0) {
+      openGridBtn.textContent = '✓ 4/4 ready';
+    } else {
+      openGridBtn.textContent = `${found.length}/4 (缺: ${missing.join(',')})`;
+    }
+    setTimeout(() => { openGridBtn.textContent = 'Grid'; }, 5000);
+  } catch (err) {
+    openGridBtn.textContent = `Err: ${err.message}`;
+    setTimeout(() => { openGridBtn.textContent = 'Grid'; }, 4000);
+  } finally {
+    openGridBtn.disabled = false;
+  }
+});
+
 async function copyDebug() {
   const original = copyDebugBtn.textContent;
   copyDebugBtn.disabled = true;
@@ -859,6 +888,53 @@ function formatDebugMarkdown(d) {
     }
   }
   L.push('');
+
+  // Grid (iframe) state — the v0.22+ path
+  if (d.grid) {
+    L.push('## Grid tab (iframe pipeline)');
+    L.push('');
+    L.push(`- **gridTabId:** ${d.grid.gridTabId ?? '(none — grid never opened)'}`);
+    if (d.grid.gridTabUrl) {
+      L.push(`- **URL:** ${d.grid.gridTabUrl}`);
+      L.push(`- **status:** \`${d.grid.gridTabStatus}\`, active: \`${d.grid.gridTabActive}\``);
+    }
+    if (d.grid.error) {
+      L.push(`- **error reading grid tab:** ${d.grid.error}`);
+    }
+    const frames = d.grid.providerFrames ?? {};
+    L.push(`- **registered iframes (provider → frameId):**`);
+    if (Object.keys(frames).length === 0) {
+      L.push('  - _(none — content scripts not registered yet)_');
+    } else {
+      for (const [p, fid] of Object.entries(frames)) {
+        L.push(`  - ${p}: ${fid}`);
+      }
+    }
+    L.push('');
+    L.push('**Per-iframe probe:**');
+    for (const provider of ['chatgpt', 'gemini', 'deepseek', 'kimi']) {
+      const probe = d.grid['probe_' + provider];
+      if (!probe) {
+        L.push(`- ${provider}: _(no frame registered)_`);
+        continue;
+      }
+      if (probe.error) {
+        L.push(`- ${provider}: ERROR \`${probe.error}\``);
+        continue;
+      }
+      L.push(`- ${provider}:`);
+      L.push(`  - href: \`${probe.href ?? '?'}\``);
+      L.push(`  - docFocus: \`${probe.docFocus}\`, vis: \`${probe.visibility}\`, msgCount: \`${probe.assistantMessageCount}\``);
+      L.push(`  - input: ${probe.input ? `${probe.input.tag} hasContent=${probe.input.hasContent} preview="${(probe.input.contentPreview ?? '').slice(0, 60)}"` : 'NOT FOUND'}`);
+      L.push(`  - sendButton: ${probe.sendButton ? `enabled=${probe.sendButton.enabled} label="${probe.sendButton.label ?? ''}"` : 'NOT FOUND'}`);
+      L.push(`  - stopButton: ${probe.stopButton ? `label="${probe.stopButton.label ?? ''}"` : 'not visible'}`);
+      L.push(`  - streaming: \`${probe.streaming}\``);
+      if (probe.latestMessagePreview) {
+        L.push(`  - latest msg: "${probe.latestMessagePreview.slice(0, 80).replace(/\n/g, ' ')}"`);
+      }
+    }
+    L.push('');
+  }
 
   L.push('## Provider states');
   L.push('');
