@@ -590,6 +590,20 @@
     input.dispatchEvent(new KeyboardEvent('keyup', opts));
   }
 
+  // Ctrl+Enter / Cmd+Enter — Gemini's Quill swallows plain Enter as
+  // newline (same as Shift+Enter); the actual submit shortcut is the
+  // modifier variant. Use this as a third-tier fallback after click + Enter.
+  function pressCtrlEnter(input) {
+    const opts = {
+      key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+      ctrlKey: true, metaKey: true,
+      bubbles: true, cancelable: true
+    };
+    input.dispatchEvent(new KeyboardEvent('keydown', opts));
+    input.dispatchEvent(new KeyboardEvent('keypress', opts));
+    input.dispatchEvent(new KeyboardEvent('keyup', opts));
+  }
+
   async function submitPrompt(prompt, skipInput) {
     let input = await waitUntil(
       () => findInput(),
@@ -665,12 +679,12 @@
       pressEnter(input);
     }
 
-    // Enter-fallback runs detached. If the click didn't fire submission, this
-    // re-tries with Enter ~1.2s later. Awaiting it here would let SPA-routing
-    // providers (e.g. DeepSeek) tear down the content script mid-await and
-    // close the message channel before sendResponse fires. The fallback
-    // doesn't need to block submitPrompt — the SW-side Phase 3 poll catches
-    // any "no text appeared" case via its 90s first-text timeout anyway.
+    // Detached fallback chain. If the click didn't fire submission, escalate:
+    //   T+1.2s: plain Enter (works for most providers)
+    //   T+3.0s: Ctrl+Enter / Cmd+Enter (Gemini Quill swallows plain Enter
+    //           as newline; modifier+Enter is its actual submit shortcut)
+    // Awaiting these would let SPA providers (DeepSeek) tear down the content
+    // script mid-await; SW-side polling catches "no text appeared" anyway.
     const inputRef = input;
     setTimeout(() => {
       try {
@@ -679,6 +693,13 @@
         }
       } catch (_) {}
     }, 1200);
+    setTimeout(() => {
+      try {
+        if (getAssistantMessages().length === beforeCount) {
+          pressCtrlEnter(inputRef);
+        }
+      } catch (_) {}
+    }, 3000);
 
     return beforeCount;
   }

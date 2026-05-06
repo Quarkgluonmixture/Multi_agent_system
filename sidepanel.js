@@ -522,6 +522,9 @@ function showThinking() {
   insertActive(currentThinking);
   emptyHint.style.display = 'none';
   scrollToBottom();
+  // Kick off the 3-stage pipeline animator (chat.html only — sidepanel
+  // doesn't have the #pipeline-animator div so this no-ops there).
+  try { window.PipelineAnimator?.start(enabledProviders, finalEditor); } catch (_) {}
 }
 
 function updateThinking(text) {
@@ -533,6 +536,7 @@ function clearThinking() {
     currentThinking.remove();
     currentThinking = null;
   }
+  try { window.PipelineAnimator?.end(); } catch (_) {}
 }
 
 function showError(message) {
@@ -782,6 +786,14 @@ chrome.runtime.onMessage.addListener((msg) => {
   } else if (msg.status === 'failed') {
     updateThinking(`[${round}] ${provider} failed`);
   }
+
+  // Drive the pipeline animator. Map our 'queued'/'running' substates to
+  // the animator's simpler running/done/failed enum.
+  try {
+    if (msg.status === 'done' || msg.status === 'failed' || msg.status === 'running') {
+      window.PipelineAnimator?.update(rawRound, provider, msg.status);
+    }
+  } catch (_) {}
 });
 
 // =================== Clear conversation ===================

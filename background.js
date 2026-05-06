@@ -1215,11 +1215,6 @@ async function runStage({ providers, prompts, stage, signal }) {
 
   if (signal?.aborted) throw new Error('Pipeline cancelled');
 
-  // ----- Phase 2: parallel submit -----
-  // All hijacks are focus-independent (DOM mutation / Quill setText with
-  // user source / Lexical setEditorState / textarea), so multiple iframes
-  // can submit simultaneously without focus contention. ~3x speedup over
-  // the previous serial-with-focus version.
   const recordHijack = (provider, r) => {
     debugState.hijackOutcome ??= {};
     const summary = r?.ok ? `ok/${r.method}` : `fail:${r?.error ?? 'unknown'}`;
@@ -1228,87 +1223,109 @@ async function runStage({ providers, prompts, stage, signal }) {
     schedulePersistDebug();
   };
 
-  await Promise.all(providers.map(async (provider) => {
-    if (failed.has(provider)) return;
-    if (signal?.aborted) { failed.add(provider); return; }
+  // Per-provider submit + poll. Throws on any failure (caller decides retry).
+  // Captures the iframe's frameId at call time so retries (which reload the
+  // iframe and produce a new frameId) work correctly.
+  async function submitAndPoll(provider, prompt) {
+    const frameId = getFrameId(gridTabId, provider);
+    if (frameId == null) throw new Error(`No frameId for ${provider}`);
 
-    try {
-      const frameId = getFrameId(gridTabId, provider);
-      if (frameId == null) throw new Error(`No frameId for ${provider}`);
+    postProvider(provider, stage, { status: 'running', stage: 'submitting' });
 
-      postProvider(provider, stage, { status: 'running', stage: 'submitting' });
-
-      let skipInput = false;
-      if (provider === 'gemini') {
-        const r = await injectGeminiPromptViaQuill(gridTabId, frameId, prompts[provider]);
-        recordHijack(provider, r);
-        if (r?.ok) skipInput = true;
-      } else if (provider === 'chatgpt') {
-        const r = await injectChatGPTPromptViaEditor(gridTabId, frameId, prompts[provider]);
-        recordHijack(provider, r);
-        if (r?.ok) skipInput = true;
-      } else if (provider === 'kimi') {
-        const r = await injectKimiPromptViaLexical(gridTabId, frameId, prompts[provider]);
-        recordHijack(provider, r);
-        if (r?.ok) skipInput = true;
-      }
-
-      // Fallback only when hijack failed — focus the iframe so execCommand
-      // path can take over. Done last to minimize race with other providers.
-      if (!skipInput && provider !== 'deepseek') {
-        try {
-          await chrome.runtime.sendMessage({ type: 'FOCUS_IFRAME', provider });
-        } catch (_) {}
-        await swSleep(600);
-        try {
-          const [check] = await chrome.scripting.executeScript({
-            target: { tabId: gridTabId, frameIds: [frameId] },
-            func: () => ({ hasFocus: document.hasFocus(), vis: document.visibilityState })
-          });
-          if (!check?.result?.hasFocus) {
-            try {
-              await chrome.runtime.sendMessage({ type: 'FOCUS_IFRAME_AGGRESSIVE', provider });
-            } catch (_) {}
-            await swSleep(400);
-          }
-        } catch (_) {}
-      }
-
-      const submitResp = await chrome.tabs.sendMessage(
-        gridTabId,
-        { type: 'SUBMIT_AND_WAIT_START', prompt: prompts[provider], skipInput },
-        { frameId }
-      );
-      if (!submitResp?.ok) throw new Error(submitResp?.error ?? 'submit failed');
-
-      postProvider(provider, stage, { status: 'running', stage: 'generating' });
-    } catch (err) {
-      failed.add(provider);
-      postProvider(provider, stage, { status: 'failed', error: err?.message ?? String(err) });
+    let skipInput = false;
+    if (provider === 'gemini') {
+      const r = await injectGeminiPromptViaQuill(gridTabId, frameId, prompt);
+      recordHijack(provider, r);
+      if (r?.ok) skipInput = true;
+    } else if (provider === 'chatgpt') {
+      const r = await injectChatGPTPromptViaEditor(gridTabId, frameId, prompt);
+      recordHijack(provider, r);
+      if (r?.ok) skipInput = true;
+    } else if (provider === 'kimi') {
+      const r = await injectKimiPromptViaLexical(gridTabId, frameId, prompt);
+      recordHijack(provider, r);
+      if (r?.ok) skipInput = true;
     }
-  }));
 
-  if (signal?.aborted) throw new Error('Pipeline cancelled');
+    if (!skipInput && provider !== 'deepseek') {
+      try {
+        await chrome.runtime.sendMessage({ type: 'FOCUS_IFRAME', provider });
+      } catch (_) {}
+      await swSleep(600);
+      try {
+        const [check] = await chrome.scripting.executeScript({
+          target: { tabId: gridTabId, frameIds: [frameId] },
+          func: () => ({ hasFocus: document.hasFocus(), vis: document.visibilityState })
+        });
+        if (!check?.result?.hasFocus) {
+          try {
+            await chrome.runtime.sendMessage({ type: 'FOCUS_IFRAME_AGGRESSIVE', provider });
+          } catch (_) {}
+          await swSleep(400);
+        }
+      } catch (_) {}
+    }
 
-  // ----- Phase 3: parallel poll for stable text -----
+    const submitResp = await chrome.tabs.sendMessage(
+      gridTabId,
+      { type: 'SUBMIT_AND_WAIT_START', prompt, skipInput },
+      { frameId }
+    );
+    if (!submitResp?.ok) throw new Error(submitResp?.error ?? 'submit failed');
+
+    postProvider(provider, stage, { status: 'running', stage: 'generating' });
+
+    const onPartialThis = onPartial ? (p) => onPartial(provider, p) : null;
+    const text = await pollFrameUntilStable(gridTabId, frameId, signal, onPartialThis);
+    if (!text) throw new Error('Empty output');
+    return text;
+  }
+
+  // ----- Phase 2 + 3: parallel submit + poll, with one retry on transient failure -----
   return await Promise.all(providers.map(async (provider) => {
     if (failed.has(provider)) {
       return { provider, ok: false, error: 'failed in earlier phase' };
     }
-    try {
-      const frameId = getFrameId(gridTabId, provider);
-      const onPartialThis = onPartial ? (p) => onPartial(provider, p) : null;
-      const text = await pollFrameUntilStable(gridTabId, frameId, signal, onPartialThis);
-      if (!text) throw new Error('Empty output');
+    if (signal?.aborted) {
+      return { provider, ok: false, error: 'Pipeline cancelled' };
+    }
 
+    let text = null;
+    let lastErr = null;
+    const MAX_ATTEMPTS = 2;
+
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        if (attempt > 1) {
+          // Reload iframe for a fresh slate before retrying. Phase 1's reload
+          // already happened for attempt 1; we redo it here for attempt 2.
+          postProvider(provider, stage, { status: 'running', stage: `retry ${attempt - 1}` });
+          await reloadProviderFrame(gridTabId, provider);
+          if (signal?.aborted) throw new Error('Pipeline cancelled');
+        }
+        text = await submitAndPoll(provider, prompts[provider]);
+        break; // success
+      } catch (err) {
+        lastErr = err;
+        const msg = err?.message ?? String(err);
+        const isTransient =
+          /No assistant text appeared|Empty output|submit failed|message channel closed|Receiving end does not exist|Generation did not complete|Probe failed|swWaitUntil timeout/i.test(msg);
+        const isCancelled = signal?.aborted || /Pipeline cancelled/.test(msg);
+        if (isCancelled) break;
+        if (!isTransient) break;
+        if (attempt === MAX_ATTEMPTS) break;
+        // else loop continues to retry
+      }
+    }
+
+    if (text != null) {
       const elapsedMs = Date.now() - (startTimes[provider] ?? startedAt);
       postProvider(provider, stage, { status: 'done', output: text, elapsedMs });
       return { provider, ok: true, output: text, elapsedMs };
-    } catch (err) {
-      const error = err?.message ?? String(err);
-      postProvider(provider, stage, { status: 'failed', error });
-      return { provider, ok: false, error };
     }
+    const error = lastErr?.message ?? String(lastErr);
+    postProvider(provider, stage, { status: 'failed', error });
+    return { provider, ok: false, error };
   }));
 }
 

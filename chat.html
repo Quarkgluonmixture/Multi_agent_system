@@ -696,6 +696,173 @@
       border-top: 1px solid var(--border-soft);
     }
 
+    /* ===== Pipeline Animator ===== */
+    #pipeline-animator {
+      position: relative;
+      width: 100%;
+      max-width: 600px;
+      height: 280px;
+      margin: 10px auto;
+      background: var(--panel-bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      overflow: hidden;
+      display: none;
+      opacity: 0;
+      transition: opacity 0.4s ease;
+      box-shadow: inset 0 2px 4px rgba(0,0,0,0.02);
+      user-select: none;
+      flex-shrink: 0;
+    }
+    #pipeline-animator.active { display: block; opacity: 1; }
+    .pa-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+    #pa-lines-layer { z-index: 1; }
+    #pa-scroll-layer { z-index: 2; pointer-events: none; }
+    #pa-avatars-layer { z-index: 3; }
+    .pa-avatar-wrapper {
+      position: absolute;
+      transform: translate(-50%, -50%);
+      display: flex; flex-direction: column; align-items: center;
+      transition: all 0.8s cubic-bezier(0.34, 1.56, 0.64, 1);
+    }
+    .pa-avatar-core {
+      width: 44px; height: 44px;
+      border-radius: var(--radius-full);
+      background: var(--panel-bg);
+      border: 2px solid var(--base-color);
+      color: var(--base-color);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 14px; font-weight: 700;
+      position: relative;
+      box-shadow: var(--shadow-md);
+      transition: all 0.3s;
+      overflow: hidden;
+    }
+    .pa-avatar-img {
+      width: 100%; height: 100%;
+      object-fit: contain;
+      padding: 4px;
+      background: #fff;
+    }
+    .pa-avatar-ring {
+      position: absolute; inset: -5px;
+      border-radius: var(--radius-full);
+      border: 2px dashed var(--base-color);
+      opacity: 0;
+      transition: opacity 0.3s;
+    }
+    .pa-role {
+      position: absolute; bottom: -12px;
+      font-size: 10px; font-weight: 600;
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: var(--base-color); color: #fff;
+      opacity: 0;
+      transform: translateY(-5px);
+      transition: all 0.4s;
+      white-space: nowrap;
+      box-shadow: var(--shadow-md);
+    }
+    .pa-status-icon {
+      position: absolute; top: -4px; right: -4px;
+      width: 16px; height: 16px;
+      background: var(--base-color);
+      border-radius: 50%;
+      border: 2px solid var(--panel-bg);
+      display: flex; align-items: center; justify-content: center;
+      opacity: 0; transform: scale(0);
+      transition: all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+    }
+    .pa-status-icon svg { width: 10px; height: 10px; stroke: #fff; stroke-width: 3; fill: none; }
+    .stage-r1 .pa-avatar-wrapper { left: var(--x-r1); top: var(--y-r1); }
+    .stage-r2 .pa-avatar-wrapper { left: var(--x-r2); top: var(--y-r2); }
+    .stage-r1 .pa-avatar-wrapper[data-status="running"] .pa-avatar-ring {
+      opacity: 0.6;
+      animation: pa-spin 3s linear infinite;
+    }
+    .stage-r1 .pa-avatar-wrapper[data-status="done"] .pa-avatar-core {
+      box-shadow: 0 0 12px var(--base-color);
+    }
+    .stage-r1 .pa-avatar-wrapper[data-status="done"] .pa-status-icon {
+      opacity: 1; transform: scale(1);
+    }
+    .stage-r2 .pa-role { opacity: 1; transform: translateY(12px); }
+    .stage-r2 .pa-avatar-wrapper[data-status="running"] .pa-avatar-core {
+      animation: pa-wiggle 0.4s ease-in-out infinite alternate;
+    }
+    .stage-r2 .pa-avatar-wrapper[data-status="done"] {
+      animation: pa-nod 0.6s ease forwards;
+    }
+    .stage-r2 .pa-avatar-wrapper[data-status="done"] .pa-status-icon {
+      opacity: 1; transform: scale(1);
+    }
+    .pa-line {
+      stroke: var(--text-muted);
+      stroke-width: 1.5;
+      stroke-dasharray: 6 6;
+      opacity: 0;
+      transition: opacity 0.5s;
+    }
+    .stage-r2 .pa-line {
+      opacity: 0.35;
+      animation: pa-flow 15s linear infinite;
+    }
+    .stage-final .pa-line { opacity: 0; }
+    .stage-final .pa-avatar-wrapper:not(.is-final) {
+      opacity: 0.15;
+      transform: translate(-50%, -50%) scale(0.6);
+      filter: grayscale(100%);
+    }
+    .stage-final .pa-avatar-wrapper:not(.is-final) {
+      left: var(--x-r1); top: var(--y-r1);
+    }
+    .stage-final .pa-avatar-wrapper.is-final {
+      left: 50%; top: 20%;
+      transform: translate(-50%, -50%) scale(1.15);
+    }
+    .stage-final .pa-avatar-wrapper.is-final .pa-avatar-core {
+      box-shadow: 0 0 20px var(--base-color);
+    }
+    .stage-final .pa-avatar-wrapper.is-final .pa-role { opacity: 0; }
+    #pa-scroll-box {
+      position: absolute;
+      left: 50%; top: 55%;
+      width: 220px; height: 0;
+      transform: translate(-50%, -50%);
+      background: var(--panel-bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      box-shadow: var(--shadow-float);
+      opacity: 0;
+      transition: all 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+      transition-delay: 0.3s;
+      overflow: hidden;
+      display: flex; flex-direction: column;
+      padding: 0 16px;
+      justify-content: center;
+      gap: 10px;
+    }
+    .stage-final #pa-scroll-box { height: 100px; opacity: 1; }
+    .pa-skeleton {
+      height: 8px;
+      border-radius: 4px;
+      background: linear-gradient(90deg, var(--border-soft) 25%, var(--border) 50%, var(--border-soft) 75%);
+      background-size: 200% 100%;
+      animation: pa-shimmer 1.5s infinite linear;
+    }
+    @keyframes pa-spin { 100% { transform: rotate(360deg); } }
+    @keyframes pa-flow { to { stroke-dashoffset: -400; } }
+    @keyframes pa-shimmer { to { background-position: -200% 0; } }
+    @keyframes pa-wiggle {
+      0%   { transform: rotate(-4deg) translateY(-1px); }
+      100% { transform: rotate(4deg) translateY(1px); }
+    }
+    @keyframes pa-nod {
+      0%   { transform: translate(-50%, -50%); }
+      50%  { transform: translate(-50%, -40%); }
+      100% { transform: translate(-50%, -50%); }
+    }
+
     /* ===== Scrollbars ===== */
     ::-webkit-scrollbar {
       width: 6px;
@@ -721,7 +888,7 @@
 </head>
 <body>
   <div class="header">
-    <h1>Multi AI Chat · v0.53</h1>
+    <h1>Multi AI Chat · v0.59</h1>
     <div class="actions">
       <button id="fullscreen-btn" title="进入全屏（再点退出）">全屏</button>
       <button id="toggle-grid-btn" title="显示 / 隐藏底部的 4 个 AI iframe（debug 用）">看 Grid</button>
@@ -747,6 +914,10 @@
       </select>
     </div>
   </div>
+
+  <!-- Pipeline animation: shows 3-stage visual (R1/R2/Final) while
+       pipeline is running. Hidden via display:none when idle. -->
+  <div id="pipeline-animator"></div>
 
   <div class="messages" id="messages">
     <div class="empty-hint" id="empty-hint">
@@ -794,6 +965,7 @@
     </div>
   </div>
 
+  <script src="pipeline-animator.js"></script>
   <script src="sidepanel.js"></script>
 </body>
 </html>
