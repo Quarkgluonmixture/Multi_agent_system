@@ -552,9 +552,10 @@
 </head>
 <body>
   <div class="header">
-    <h1>Multi AI Chat · v0.46 (sidepanel)</h1>
+    <h1>Multi AI Chat · v0.47</h1>
     <div class="actions">
-      <button id="open-chat-tab-btn" title="在普通 tab 里打开完整版 chat（推荐）">在 Tab 打开</button>
+      <button id="fullscreen-btn" title="进入全屏（再点退出）">全屏</button>
+      <button id="toggle-grid-btn" title="显示 / 隐藏底部的 4 个 AI iframe（debug 用）">看 Grid</button>
       <button id="theme-btn" title="切换主题">深色</button>
       <button id="clear-btn" title="清空对话">新对话</button>
       <button id="copy-debug" title="复制 debug 信息">Debug</button>
@@ -591,7 +592,36 @@
   </div>
 
   <div class="footer-hint">
-    每条消息跑 R1 → R2 → Final 三轮，约 50-80s。AI 在 Grid 页 4 个 iframe 里**真正并行**——保持 Grid 页可见以避免节流。
+    每条消息跑 R1 → R2 → Final 三轮，约 50-80s。4 个 AI iframe 嵌在本 tab 底部隐藏区——不再开独立窗口。
+  </div>
+
+  <!-- Embedded grid section. Hidden via clip-path: inset(100%) — the
+       element occupies normal viewport coordinates (so Chrome's
+       IntersectionObserver considers it "intersecting" and doesn't throttle
+       iframe rAF/rendering priority), and computed CSS shows
+       visibility:visible / opacity:1 (so Gemini's anti-bot checks pass),
+       but visually nothing paints because the entire content is clipped.
+       History of failed alternatives:
+         - visibility:hidden  → throttled (CG/DS slow)
+         - opacity:0          → broke Gemini submit (anti-bot)
+         - left:-2000px       → off-viewport slowed CG/DS again
+       clip-path:inset(100%) is the four-quadrant winner. -->
+  <div id="bg-grid-section" style="
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 1280px;
+    height: 900px;
+    clip-path: inset(100%);
+    pointer-events: none;
+    background: #18181b;
+  ">
+    <div style="display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 2px; width: 100%; height: 100%;">
+      <iframe id="cg" data-provider="chatgpt" src="https://chatgpt.com/?temporary-chat=true" style="width:100%;height:100%;border:0;background:white;"></iframe>
+      <iframe id="g" data-provider="gemini" src="https://gemini.google.com/app" style="width:100%;height:100%;border:0;background:white;"></iframe>
+      <iframe id="ds" data-provider="deepseek" src="https://chat.deepseek.com/" style="width:100%;height:100%;border:0;background:white;"></iframe>
+      <iframe id="km" data-provider="kimi" src="https://www.kimi.com/" style="width:100%;height:100%;border:0;background:white;"></iframe>
+    </div>
   </div>
 
   <script src="sidepanel.js"></script>

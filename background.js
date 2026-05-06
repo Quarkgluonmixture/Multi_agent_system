@@ -1,6 +1,25 @@
+// Action icon click → open chat.html as tab (single-tab workspace).
+// Sidepanel is still available via right-click → "open side panel" if user
+// wants the narrow mode.
 chrome.sidePanel
-  .setPanelBehavior({ openPanelOnActionClick: true })
+  .setPanelBehavior({ openPanelOnActionClick: false })
   .catch(console.error);
+
+chrome.action.onClicked.addListener(async () => {
+  try {
+    const chatUrl = chrome.runtime.getURL('chat.html');
+    const tabs = await chrome.tabs.query({});
+    const existing = tabs.find(t => t.url === chatUrl || t.url?.startsWith(chatUrl + '#'));
+    if (existing) {
+      await chrome.tabs.update(existing.id, { active: true });
+      try {
+        await chrome.windows.update(existing.windowId, { focused: true });
+      } catch (_) {}
+    } else {
+      await chrome.tabs.create({ url: chatUrl, active: true });
+    }
+  } catch (_) {}
+});
 
 const PROVIDERS = {
   chatgpt: {
@@ -36,6 +55,11 @@ function pickFinalEditor(enabled) {
 // load via CONTENT_SCRIPT_REGISTER, so SW can map provider → frameId for
 // targeted message dispatch.
 
+// gridTabId is the tab containing the embedded AI iframes. As of v0.46
+// this is the chat.html workspace tab — chat UI + 4 hidden iframes all
+// in one tab. No separate window. For backward compat, falls back to
+// grid.html if a chat.html tab isn't present (e.g., user manually opens
+// grid.html for debugging).
 let gridTabId = null;
 // providerFrames: tabId → { provider → frameId }
 const providerFrames = new Map();
@@ -50,8 +74,22 @@ async function getOrCreateGridTab() {
       providerFrames.delete(gridTabId);
     }
   }
-  const url = chrome.runtime.getURL('grid.html');
-  const tab = await chrome.tabs.create({ url, active: false });
+  // Look for an already-open chat.html or grid.html tab anywhere
+  const chatUrl = chrome.runtime.getURL('chat.html');
+  const gridUrl = chrome.runtime.getURL('grid.html');
+  try {
+    const tabs = await chrome.tabs.query({});
+    for (const t of tabs) {
+      if (t.url === chatUrl || t.url?.startsWith(chatUrl + '#') ||
+          t.url === gridUrl || t.url?.startsWith(gridUrl + '#')) {
+        gridTabId = t.id;
+        schedulePersistDebug();
+        return gridTabId;
+      }
+    }
+  } catch (_) {}
+  // None open — create chat.html as a new tab (current window, inactive).
+  const tab = await chrome.tabs.create({ url: chatUrl, active: false });
   gridTabId = tab.id;
   schedulePersistDebug();
   return gridTabId;
@@ -549,24 +587,31 @@ async function tryInjectQuillOnce(gridTabId, frameId, text) {
           } catch (_) {}
         };
 
+        // Mark Quill as focused — Gemini's submit handler appears to check
+        // editor focus state before processing send-button clicks. Without
+        // this, setText succeeds but the send click is silently rejected.
+        const finalize = () => {
+          setSelectionEnd();
+          try { if (typeof quill.focus === 'function') quill.focus(); } catch (_) {}
+        };
+
         try {
           if (typeof quill.setText === 'function') {
             quill.setText(txt + '\n', SOURCE);
-            setSelectionEnd();
+            finalize();
             return { ok: true, method: 'setText/user', diag };
           }
           if (typeof quill.insertText === 'function') {
-            // Clear first if there's existing content
             if (typeof quill.deleteText === 'function' && typeof quill.getLength === 'function') {
               try { quill.deleteText(0, quill.getLength(), SOURCE); } catch (_) {}
             }
             quill.insertText(0, txt, SOURCE);
-            setSelectionEnd();
+            finalize();
             return { ok: true, method: 'insertText/user', diag };
           }
           if (typeof quill.setContents === 'function') {
             quill.setContents([{ insert: txt + '\n' }], SOURCE);
-            setSelectionEnd();
+            finalize();
             return { ok: true, method: 'setContents/user', diag };
           }
           if (quill.clipboard && typeof quill.clipboard.dangerouslyPasteHTML === 'function') {
@@ -576,7 +621,7 @@ async function tryInjectQuillOnce(gridTabId, frameId, text) {
               .replace(/>/g, '&gt;')
               .replace(/\n/g, '<br>');
             quill.clipboard.dangerouslyPasteHTML(0, '<p>' + escaped + '</p>', SOURCE);
-            setSelectionEnd();
+            finalize();
             return { ok: true, method: 'clipboard.dangerouslyPasteHTML', diag };
           }
         } catch (err) {
@@ -885,7 +930,11 @@ async function pollFrameUntilStable(gridTabId, frameId, signal, onPartial) {
   const FALLBACK_STABLE_MS = 12000;
   const TIMEOUT_MS = 300000;
   const POLL_MS = 500;
-  const FIRST_TEXT_TIMEOUT_MS = 90000;
+  // 180s. Was 90 → 120 → 180. Some providers (ChatGPT, DeepSeek) hit
+  // rate-limit-adjacent slowness when the same conversation keeps probing
+  // similar prompts, and parallel Phase 2 means 4 simultaneous server
+  // requests can saturate the per-IP queue.
+  const FIRST_TEXT_TIMEOUT_MS = 180000;
 
   let lastText = '';
   let lastChangedAt = Date.now();
@@ -983,8 +1032,13 @@ async function rehydrateGridState() {
   if (!candId) return;
   try {
     const tab = await chrome.tabs.get(candId);
-    const expectedPrefix = chrome.runtime.getURL('grid.html');
-    if (!tab?.url || !tab.url.startsWith(expectedPrefix)) return;
+    const chatUrl = chrome.runtime.getURL('chat.html');
+    const gridUrl = chrome.runtime.getURL('grid.html');
+    const ok = tab?.url && (
+      tab.url === chatUrl || tab.url.startsWith(chatUrl + '#') ||
+      tab.url === gridUrl || tab.url.startsWith(gridUrl + '#')
+    );
+    if (!ok) return;
     gridTabId = candId;
   } catch (_) { return; }
   // Ping all frames to re-register. Errors are expected for frames that
@@ -1161,13 +1215,22 @@ async function runStage({ providers, prompts, stage, signal }) {
 
   if (signal?.aborted) throw new Error('Pipeline cancelled');
 
-  // ----- Phase 2: serial submit (focus + inject + click + wait first token) -----
-  for (const provider of providers) {
-    if (failed.has(provider)) continue;
-    if (signal?.aborted) {
-      failed.add(provider);
-      continue;
-    }
+  // ----- Phase 2: parallel submit -----
+  // All hijacks are focus-independent (DOM mutation / Quill setText with
+  // user source / Lexical setEditorState / textarea), so multiple iframes
+  // can submit simultaneously without focus contention. ~3x speedup over
+  // the previous serial-with-focus version.
+  const recordHijack = (provider, r) => {
+    debugState.hijackOutcome ??= {};
+    const summary = r?.ok ? `ok/${r.method}` : `fail:${r?.error ?? 'unknown'}`;
+    const diagStr = r?.diag ? ` | diag=${JSON.stringify(r.diag)}` : '';
+    debugState.hijackOutcome[`${stage}:${provider}`] = summary + diagStr;
+    schedulePersistDebug();
+  };
+
+  await Promise.all(providers.map(async (provider) => {
+    if (failed.has(provider)) return;
+    if (signal?.aborted) { failed.add(provider); return; }
 
     try {
       const frameId = getFrameId(gridTabId, provider);
@@ -1175,55 +1238,40 @@ async function runStage({ providers, prompts, stage, signal }) {
 
       postProvider(provider, stage, { status: 'running', stage: 'submitting' });
 
-      // Focus this iframe — exclusive focus since we serialized
-      try {
-        await chrome.runtime.sendMessage({ type: 'FOCUS_IFRAME', provider });
-      } catch (_) {}
-      // Give the focus chain a real moment to settle. iframe.focus() is
-      // async-ish under the hood and 200ms isn't enough on slower machines.
-      await swSleep(600);
-
-      // Verify focus actually took (programmatic focus without user gesture
-      // may be a no-op). If not focused, retry with mouse-click simulation.
-      try {
-        const [check] = await chrome.scripting.executeScript({
-          target: { tabId: gridTabId, frameIds: [frameId] },
-          func: () => ({ hasFocus: document.hasFocus(), vis: document.visibilityState })
-        });
-        if (!check?.result?.hasFocus) {
-          // Try a more aggressive focus attempt via mouse-event simulation in grid
-          try {
-            await chrome.runtime.sendMessage({ type: 'FOCUS_IFRAME_AGGRESSIVE', provider });
-          } catch (_) {}
-          await swSleep(400);
-        }
-      } catch (_) {}
-
-      // Editor API hijacks — focus-independent injection. If hijack succeeds,
-      // pass skipInput so submitPrompt only verifies + clicks send (doesn't
-      // try execCommand which needs document focus).
-      //   Gemini → Quill
-      //   ChatGPT → ProseMirror EditorView (or Lexical if they switched)
       let skipInput = false;
-      const recordHijack = (r) => {
-        debugState.hijackOutcome ??= {};
-        const summary = r?.ok ? `ok/${r.method}` : `fail:${r?.error ?? 'unknown'}`;
-        const diagStr = r?.diag ? ` | diag=${JSON.stringify(r.diag)}` : '';
-        debugState.hijackOutcome[`${stage}:${provider}`] = summary + diagStr;
-        schedulePersistDebug();
-      };
       if (provider === 'gemini') {
         const r = await injectGeminiPromptViaQuill(gridTabId, frameId, prompts[provider]);
-        recordHijack(r);
+        recordHijack(provider, r);
         if (r?.ok) skipInput = true;
       } else if (provider === 'chatgpt') {
         const r = await injectChatGPTPromptViaEditor(gridTabId, frameId, prompts[provider]);
-        recordHijack(r);
+        recordHijack(provider, r);
         if (r?.ok) skipInput = true;
       } else if (provider === 'kimi') {
         const r = await injectKimiPromptViaLexical(gridTabId, frameId, prompts[provider]);
-        recordHijack(r);
+        recordHijack(provider, r);
         if (r?.ok) skipInput = true;
+      }
+
+      // Fallback only when hijack failed — focus the iframe so execCommand
+      // path can take over. Done last to minimize race with other providers.
+      if (!skipInput && provider !== 'deepseek') {
+        try {
+          await chrome.runtime.sendMessage({ type: 'FOCUS_IFRAME', provider });
+        } catch (_) {}
+        await swSleep(600);
+        try {
+          const [check] = await chrome.scripting.executeScript({
+            target: { tabId: gridTabId, frameIds: [frameId] },
+            func: () => ({ hasFocus: document.hasFocus(), vis: document.visibilityState })
+          });
+          if (!check?.result?.hasFocus) {
+            try {
+              await chrome.runtime.sendMessage({ type: 'FOCUS_IFRAME_AGGRESSIVE', provider });
+            } catch (_) {}
+            await swSleep(400);
+          }
+        } catch (_) {}
       }
 
       const submitResp = await chrome.tabs.sendMessage(
@@ -1238,7 +1286,7 @@ async function runStage({ providers, prompts, stage, signal }) {
       failed.add(provider);
       postProvider(provider, stage, { status: 'failed', error: err?.message ?? String(err) });
     }
-  }
+  }));
 
   if (signal?.aborted) throw new Error('Pipeline cancelled');
 
@@ -1594,10 +1642,46 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return false;
   }
   if (msg.type === 'OPEN_GRID') {
+    // Bring the workspace tab to foreground + activate.
     getOrCreateGridTab()
-      .then(tabId => chrome.tabs.update(tabId, { active: true }))
+      .then(async tabId => {
+        await chrome.tabs.update(tabId, { active: true });
+        try {
+          const tab = await chrome.tabs.get(tabId);
+          if (tab.windowId != null) {
+            await chrome.windows.update(tab.windowId, { focused: true });
+          }
+        } catch (_) {}
+        return tabId;
+      })
       .then(() => sendResponse({ ok: true, gridTabId }))
       .catch(err => sendResponse({ ok: false, error: err.message ?? String(err) }));
+    return true;
+  }
+  if (msg.type === 'OPEN_CHAT_TAB') {
+    // Open the chat.html workspace tab (the v0.46 single-tab UI).
+    (async () => {
+      try {
+        const chatUrl = chrome.runtime.getURL('chat.html');
+        const tabs = await chrome.tabs.query({});
+        const existing = tabs.find(t => t.url === chatUrl || t.url?.startsWith(chatUrl + '#'));
+        if (existing) {
+          await chrome.tabs.update(existing.id, { active: true });
+          try {
+            await chrome.windows.update(existing.windowId, { focused: true });
+          } catch (_) {}
+          gridTabId = existing.id;
+          sendResponse({ ok: true, reused: true, tabId: existing.id });
+          return;
+        }
+        const tab = await chrome.tabs.create({ url: chatUrl, active: true });
+        gridTabId = tab.id;
+        schedulePersistDebug();
+        sendResponse({ ok: true, tabId: tab.id });
+      } catch (err) {
+        sendResponse({ ok: false, error: err.message ?? String(err) });
+      }
+    })();
     return true;
   }
   if (msg.type === 'GRID_STATUS') {

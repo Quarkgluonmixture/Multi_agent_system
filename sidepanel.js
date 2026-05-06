@@ -832,6 +832,66 @@ openGridBtn?.addEventListener('click', async () => {
   }
 });
 
+// Sidepanel-only: button to open the chat.html workspace tab.
+const openChatTabBtn = document.getElementById('open-chat-tab-btn');
+openChatTabBtn?.addEventListener('click', async () => {
+  openChatTabBtn.disabled = true;
+  try {
+    await chrome.runtime.sendMessage({ type: 'OPEN_CHAT_TAB' });
+    openChatTabBtn.textContent = '✓ 已打开';
+  } catch (err) {
+    openChatTabBtn.textContent = `Err: ${err.message}`;
+  } finally {
+    setTimeout(() => { openChatTabBtn.textContent = '在 Tab 打开'; openChatTabBtn.disabled = false; }, 2000);
+  }
+});
+
+// Fullscreen toggle (chat.html only). F11-equivalent on the chat document.
+const fullscreenBtn = document.getElementById('fullscreen-btn');
+fullscreenBtn?.addEventListener('click', async () => {
+  try {
+    if (document.fullscreenElement) {
+      await document.exitFullscreen();
+      fullscreenBtn.textContent = '全屏';
+    } else {
+      await document.documentElement.requestFullscreen();
+      fullscreenBtn.textContent = '退全屏';
+    }
+  } catch (err) {
+    fullscreenBtn.textContent = `Err: ${err.message}`;
+    setTimeout(() => { fullscreenBtn.textContent = '全屏'; }, 2000);
+  }
+});
+document.addEventListener('fullscreenchange', () => {
+  if (fullscreenBtn) {
+    fullscreenBtn.textContent = document.fullscreenElement ? '退全屏' : '全屏';
+  }
+});
+
+// Toggle the embedded grid section visibility via clip-path. Element
+// stays in viewport with normal computed style (avoids iframe throttling
+// and anti-bot rejection), only the clipping changes.
+const toggleGridBtn = document.getElementById('toggle-grid-btn');
+if (toggleGridBtn) {
+  let visible = false;
+  toggleGridBtn.addEventListener('click', () => {
+    const sec = document.getElementById('bg-grid-section');
+    if (!sec) return;
+    visible = !visible;
+    if (visible) {
+      sec.style.clipPath = 'inset(0)';
+      sec.style.zIndex = '100';
+      sec.style.pointerEvents = 'auto';
+      toggleGridBtn.textContent = '藏 Grid';
+    } else {
+      sec.style.clipPath = 'inset(100%)';
+      sec.style.zIndex = 'auto';
+      sec.style.pointerEvents = 'none';
+      toggleGridBtn.textContent = '看 Grid';
+    }
+  });
+}
+
 async function copyDebug() {
   const original = copyDebugBtn.textContent;
   copyDebugBtn.disabled = true;
