@@ -103,7 +103,7 @@
       padding: 0;
       height: 100%;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-      font-size: 13px;
+      font-size: 14px;
       background: var(--bg);
       color: var(--text);
     }
@@ -124,7 +124,7 @@
     }
     .header h1 {
       margin: 0;
-      font-size: 13px;
+      font-size: 14px;
       font-weight: 600;
       color: var(--text);
     }
@@ -200,6 +200,12 @@
       text-decoration: line-through;
       opacity: 0.55;
     }
+    .provider-pill .role {
+      font-size: 9px;
+      font-weight: normal;
+      opacity: 0.78;
+      margin-left: 5px;
+    }
 
     .messages {
       flex: 1;
@@ -215,7 +221,7 @@
       color: var(--text-muted);
       text-align: center;
       margin-top: 30vh;
-      font-size: 12px;
+      font-size: 13px;
       line-height: 1.5;
       padding: 0 16px;
     }
@@ -335,7 +341,7 @@
     }
 
     /* ===== Markdown rendering inside assistant bubbles ===== */
-    .markdown { font-size: 13px; }
+    .markdown { font-size: 14px; }
     .markdown > *:first-child { margin-top: 0; }
     .markdown > *:last-child { margin-bottom: 0; }
     .markdown h1, .markdown h2, .markdown h3,
@@ -344,11 +350,11 @@
       margin: 14px 0 6px;
       line-height: 1.25;
     }
-    .markdown h1 { font-size: 19px; border-bottom: 1px solid var(--border); padding-bottom: 4px; }
-    .markdown h2 { font-size: 16px; }
-    .markdown h3 { font-size: 14px; }
-    .markdown h4 { font-size: 13px; }
-    .markdown h5, .markdown h6 { font-size: 12.5px; }
+    .markdown h1 { font-size: 21px; border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+    .markdown h2 { font-size: 18px; }
+    .markdown h3 { font-size: 16px; }
+    .markdown h4 { font-size: 14px; }
+    .markdown h5, .markdown h6 { font-size: 13px; }
     .markdown strong { font-weight: 700; }
     .markdown p { margin: 6px 0; }
     .markdown ul, .markdown ol { margin: 6px 0; padding-left: 22px; }
@@ -369,7 +375,7 @@
     }
     .markdown code {
       font-family: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, "Liberation Mono", monospace;
-      font-size: 11.5px;
+      font-size: 12.5px;
       background: var(--code-bg);
       padding: 1px 5px;
       border-radius: 3px;
@@ -380,7 +386,7 @@
       border-radius: 4px;
       overflow-x: auto;
       margin: 6px 0;
-      font-size: 11.5px;
+      font-size: 12.5px;
       line-height: 1.4;
     }
     .markdown pre code {
@@ -396,7 +402,7 @@
       border: 1px dashed var(--thinking-border);
       color: var(--thinking-text);
       font-style: italic;
-      font-size: 12px;
+      font-size: 13px;
       white-space: pre-wrap;
     }
     .msg.error {
@@ -480,14 +486,14 @@
     }
     .input-bar textarea {
       flex: 1;
-      min-height: 36px;
-      max-height: 180px;
+      min-height: 38px;
+      max-height: 200px;
       resize: none;
       border: 1px solid var(--input-border);
       border-radius: 6px;
       padding: 8px;
       font-family: inherit;
-      font-size: 13px;
+      font-size: 14px;
       outline: none;
       background: var(--input-bg);
       color: var(--text);
@@ -546,7 +552,7 @@
 </head>
 <body>
   <div class="header">
-    <h1>Multi AI Chat · v0.18</h1>
+    <h1>Multi AI Chat · v0.20</h1>
     <div class="actions">
       <button id="theme-btn" title="切换主题">深色</button>
       <button id="clear-btn" title="清空对话">新对话</button>
@@ -556,10 +562,10 @@
 
   <div class="provider-bar tight" id="provider-bar">
     <span class="pb-label" title="参与 R1 + R2 互相 review 的模型，至少 2 个">参与</span>
-    <button class="provider-pill" data-provider="chatgpt"  data-enabled="true" title="点击切换；至少保留 2 个">ChatGPT</button>
-    <button class="provider-pill" data-provider="gemini"   data-enabled="true" title="点击切换；至少保留 2 个">Gemini</button>
-    <button class="provider-pill" data-provider="deepseek" data-enabled="true" title="点击切换；至少保留 2 个">DeepSeek</button>
-    <button class="provider-pill" data-provider="kimi"     data-enabled="true" title="点击切换；至少保留 2 个">Kimi</button>
+    <button class="provider-pill" data-provider="chatgpt"  data-enabled="true">ChatGPT<span class="role">杠精</span></button>
+    <button class="provider-pill" data-provider="gemini"   data-enabled="true">Gemini<span class="role">串子</span></button>
+    <button class="provider-pill" data-provider="deepseek" data-enabled="true">DeepSeek<span class="role">懂王</span></button>
+    <button class="provider-pill" data-provider="kimi"     data-enabled="true">Kimi<span class="role">打工人</span></button>
     <div class="final-group" title="最终主编：读三家 R2 输出做合成。可以不在&quot;参与&quot;里">
       <span class="pb-label">合成</span>
       <select id="final-editor">

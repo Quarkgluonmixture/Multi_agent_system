@@ -571,53 +571,132 @@ ${userPrompt}
 </answer>`;
 }
 
-function buildR2Prompt(userPrompt, selfProvider, r1Outputs, history = []) {
+// =================== R2 roles ===================
+//
+// In R2 each provider plays a distinct cognitive role so cross-review
+// produces real divergence rather than four polite reformulations of the
+// same answer. Each role has explicit anti-fluff guards specific to its
+// failure mode (LLMs default to smooth-sounding platitudes).
+
+const R2_ROLES = {
+  '缝合怪': `你是缝合怪。不生产观点，只做代码/逻辑的无情搬运工——把三家答案里最实用的零件强行缝起来，不在乎风格统一。
+
+具体输出：
+1. 列每家答案最值得保留的 1-2 个具体观点（**引用原话**，不准换措辞）
+2. 把这些观点拼成一份新答案，最短最直接
+
+禁忌：不要润色冲突；不要平衡观点；不要解释为啥这么缝。`,
+
+  '杠精': `你是杠精。默认所有方案都是垃圾。核心任务是阴阳怪气地挑出致命漏洞，不服就干。
+
+具体输出：
+1. 找每家答案里最经不起推敲的 1 个**具体论断**（不是模糊立场）
+2. 给反驳理由（反例 / 反面证据 / 自相矛盾处）
+3. 用最直接的语气，不和稀泥
+
+禁忌：
+- 严禁"也有道理但是..."、"辩证地看"这种平衡腔
+- 挑不出毛病就直接说"这一点我承认挑不出问题"，**不准硬编"补充"**`,
+
+  '懂王': `你是懂王。极度偏执，眼里揉不得沙子，永远追问"本质是什么"，把表面问题扒得只剩底裤。
+
+具体输出：
+1. 这问题的**不可约束核心约束**是什么（物理 / 经济 / 时间 / 信息 / 信任 / 注意力 — 哪一类，几个）
+2. 三家答案里有没有人**在回答错的问题**？指出他们的 hidden assumption
+3. 抛开他们的回答，从核心约束重新推导 — 真正的答案应该是什么
+
+严禁（你这角色最容易翻车的地方，LLM 在"第一性原理"上特别容易退化成顺滑废话）：
+- 严禁车轱辘话（"问题的本质是问题的本质"）
+- 严禁假大空哲学口号（"关键在于执行" / "找到平衡点" / "一切皆有可能" / "因人而异"）
+- 你给的每个"本质"判断**必须可证伪** — 同时写出"什么情况下我这个判断会被推翻"`,
+
+  '串子': `你是串子。绝不就事论事，喜欢疯狂跨界举例，把历史 / 别的圈子的瓜搬过来强行对比。
+
+具体输出：
+1. 找一个看似无关、但**结构相似**的情境（历史事件 / 其他行业 / 其他文化）
+2. 那个情境里：发生了什么、谁赢谁输、为什么
+3. 跟当前问题最关键的一个**结构性差异** — 这个差异决定了能不能直接套用
+
+禁忌：
+- 不要列三个泛泛类比 — 选一个，讲透
+- 不要把类比当结论 — 要把"差异"讲清楚`,
+
+  '打工人': `你是打工人。极其务实且不耐烦，讨厌一切宏大叙事，只甩出"明天早起第一步先干啥"的说明书。
+
+具体输出：
+1. 用户**明早 9 点**起来，第一件事具体干什么（具体到打开哪个 app / 给谁发什么消息 / 写下哪几行字）
+2. 这一步花多久、需要什么、可能在哪卡住
+3. 完成的标志是什么（能用什么验证 done 而不是 doing）
+
+严禁（你这角色最容易翻车的地方，LLM 在"实操建议"上特别容易退化成正确的废话）：
+- 严禁"正确的废话"（"循序渐进" / "保持耐心" / "做好规划" / "重视执行"）
+- 严禁列 7 步五年计划 — **最多到第三步**，重点是第一步
+- 每一步必须是可执行**动作**（"考虑 X" 不算，"打开 X 写下 Y" 才算）`
+};
+
+const DEFAULT_ROLE_MAPPING = {
+  chatgpt:  '杠精',
+  deepseek: '懂王',
+  kimi:     '打工人',
+  gemini:   '串子'
+};
+
+function buildR2Prompt(userPrompt, selfProvider, r1Outputs, history = [], roleId) {
   const others = ALL_PROVIDERS
     .filter(p => p !== selfProvider && r1Outputs[p])
-    .map(p => `<other_answer provider="${p}">\n${r1Outputs[p]}\n</other_answer>`)
+    .map(p => `<answer provider="${p}">\n${r1Outputs[p]}\n</answer>`)
     .join('\n\n');
 
   const selfAnswer = r1Outputs[selfProvider] ?? '(missing)';
+  const rolePrompt = R2_ROLES[roleId];
 
-  return `你是交叉评审 agent。你将看到自己的第一轮回答，以及其他模型的第一轮回答。任务不是辩护自己，而是诚实地评估、吸收、反驳。
+  // Fallback to the original generic R2 if role unknown (defensive)
+  if (!rolePrompt) {
+    return `你是交叉评审 agent。看完三家答案后，给出你的修正版回答。
 
 ${historyBlock(history)}本轮用户问题：
 ${userPrompt}
 
 你的第一轮回答：
-<self_answer>
-${selfAnswer}
-</self_answer>
+<self_answer>${selfAnswer}</self_answer>
 
 其他模型回答：
 ${others}
 
-请严格按以下格式输出：
+请输出修正后的完整回答。`;
+  }
 
-<revision>
-共识：
-（三家都同意的核心点）
+  return `${historyBlock(history)}原始问题：
+${userPrompt}
 
-我吸收的观点：
-1. 来自 [模型名]：（具体哪一句让你改了想法）
-2. ...
+三家的第一轮答案如下：
 
-我不同意的观点：
-1. （指出哪个模型的哪一点你认为错了，给理由）
-2. ...
+<answer provider="${selfProvider}" self="true">
+${selfAnswer}
+</answer>
 
-修正后的完整回答：
-（不是 diff，是完整的新版本——融合了你接受的他人观点 + 你坚持的原观点）
+${others}
 
-仍然存在的分歧：
-（你判断哪些点这一轮没法和解，留给最终主编裁决）
-</revision>`;
+---
+
+你扮演的角色：**${roleId}**
+
+${rolePrompt}
+
+---
+
+请按你这个角色的立场，看完三家答案后输出你的 R2。
+不要被"应该公平评估每家"绑架——你就是这个角色，按角色该说的方式说。`;
 }
 
-function buildFinalPrompt(userPrompt, r2Outputs, history = []) {
+function buildFinalPrompt(userPrompt, r2Outputs, history = [], roleMapping = {}) {
   const sections = ALL_PROVIDERS
     .filter(p => r2Outputs[p])
-    .map(p => `<revised_answer provider="${p}">\n${r2Outputs[p]}\n</revised_answer>`)
+    .map(p => {
+      const role = roleMapping[p];
+      const roleAttr = role ? ` role="${role}"` : '';
+      return `<r2 provider="${p}"${roleAttr}>\n${r2Outputs[p]}\n</r2>`;
+    })
     .join('\n\n');
 
   return `你是最终主编。你的任务不是平均三份答案，而是判断、去重、合并、裁剪、解决矛盾。把读者当成只读你这一份输出的人——他们看不到上面三份原文，也看不到 R1/R2 的内部结构。
@@ -625,7 +704,7 @@ function buildFinalPrompt(userPrompt, r2Outputs, history = []) {
 ${historyBlock(history)}本轮用户问题：
 ${userPrompt}
 
-三份第二轮回答如下：
+三份第二轮回答如下（每家在 R2 扮演了一个角色，看 \`role\` 属性。它们的语气和侧重是**故意倾斜**的，你需要据此判断各家的偏向，不要被任何单方说服）：
 
 ${sections}
 
@@ -669,7 +748,7 @@ async function closeAllProviderTabs() {
   }
 }
 
-async function runFullPipeline(userPrompt, history = [], enabledProviders, finalEditorOverride, signal) {
+async function runFullPipeline(userPrompt, history = [], enabledProviders, finalEditorOverride, roleMapping, signal) {
   const providers = (Array.isArray(enabledProviders) && enabledProviders.length > 0)
     ? enabledProviders.filter(p => PROVIDERS[p])
     : ALL_PROVIDERS;
@@ -683,11 +762,14 @@ async function runFullPipeline(userPrompt, history = [], enabledProviders, final
       ? finalEditorOverride
       : pickFinalEditor(providers);
 
+  // Merge user-provided role mapping over defaults so unmapped providers fall back
+  const roles = { ...DEFAULT_ROLE_MAPPING, ...(roleMapping || {}) };
+
   const checkAbort = () => {
     if (signal?.aborted) throw new Error('Pipeline cancelled');
   };
 
-  // Round 1
+  // Round 1 (no role — independent baseline answer)
   checkAbort();
   const r1Prompt = buildR1Prompt(userPrompt, history);
   const r1Prompts = Object.fromEntries(providers.map(p => [p, r1Prompt]));
@@ -704,11 +786,11 @@ async function runFullPipeline(userPrompt, history = [], enabledProviders, final
     throw new Error(`R1 only produced ${r1Survivors.length} valid output(s); need ≥2 to proceed`);
   }
 
-  // Round 2
+  // Round 2 — each surviving provider plays its assigned role
   checkAbort();
   const r2Prompts = {};
   for (const p of r1Survivors) {
-    r2Prompts[p] = buildR2Prompt(userPrompt, p, r1Outputs, history);
+    r2Prompts[p] = buildR2Prompt(userPrompt, p, r1Outputs, history, roles[p]);
   }
   const r2Results = await runStage({
     providers: r1Survivors, prompts: r2Prompts, stage: 'r2', signal
@@ -722,9 +804,9 @@ async function runFullPipeline(userPrompt, history = [], enabledProviders, final
     throw new Error('R2 produced too few outputs to synthesize');
   }
 
-  // Final
+  // Final — synthesizer sees role labels on each R2 so it knows the bias direction
   checkAbort();
-  const finalPrompt = buildFinalPrompt(userPrompt, r2Outputs, history);
+  const finalPrompt = buildFinalPrompt(userPrompt, r2Outputs, history, roles);
   const finalResults = await runStage({
     providers: [finalEditor], prompts: { [finalEditor]: finalPrompt }, stage: 'final', signal
   });
@@ -732,7 +814,8 @@ async function runFullPipeline(userPrompt, history = [], enabledProviders, final
   return {
     r1: r1Results,
     r2: r2Results,
-    final: finalResults[0]
+    final: finalResults[0],
+    roles
   };
 }
 
@@ -755,7 +838,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     activePipelineAbort = new AbortController();
     const signal = activePipelineAbort.signal;
 
-    runFullPipeline(msg.prompt, msg.history ?? [], msg.providers, msg.finalEditor, signal)
+    runFullPipeline(msg.prompt, msg.history ?? [], msg.providers, msg.finalEditor, msg.roleMapping, signal)
       .then(data => sendResponse({ ok: true, ...data }))
       .catch(err => {
         const cancelled = signal.aborted || err.message === 'Pipeline cancelled';
