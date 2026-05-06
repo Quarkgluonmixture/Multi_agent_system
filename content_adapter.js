@@ -683,13 +683,6 @@
     return beforeCount;
   }
 
-  async function waitForGenerationStart(beforeCount) {
-    await waitUntil(
-      () => getAssistantMessages().length > beforeCount,
-      { timeoutMs: 60000, intervalMs: 500 }
-    );
-  }
-
   function isStreaming() {
     const sels = config.streamingIndicatorSelectors;
     if (!sels || sels.length === 0) return false;
@@ -703,107 +696,20 @@
     return false;
   }
 
-  async function waitForGenerationEnd() {
-    const STABLE_MS = 5000;          // primary: UI confirms done + stable (was 3500 — too eager on Kimi pauses)
-    const FALLBACK_STABLE_MS = 14000; // fallback: text stable this long → done regardless of UI
-    const TIMEOUT_MS = 300000;
-    const POLL_MS = 500;
-
-    const start = Date.now();
-    let lastText = '';
-    let lastChangedAt = Date.now();
-
-    while (Date.now() - start < TIMEOUT_MS) {
-      const text = getLatestAssistantText();
-      const stopVisible = !!findStopButton();
-      const streaming = isStreaming();
-
-      if (text !== lastText) {
-        lastText = text;
-        lastChangedAt = Date.now();
-      }
-
-      const stableFor = Date.now() - lastChangedAt;
-
-      // Primary: framework UI says generating is done AND text settled.
-      // Fires fast (3.5s) when the tab is in the foreground and re-renders normally.
-      if (text && !stopVisible && !streaming && stableFor >= STABLE_MS) {
-        return text;
-      }
-
-      // Fallback: in hidden tabs the framework defers re-renders so stop-button /
-      // streaming-class may stay stale even after generation actually finished.
-      // If text itself hasn't moved for FALLBACK_STABLE_MS we trust that and return.
-      if (text && stableFor >= FALLBACK_STABLE_MS) {
-        return text;
-      }
-
-      await sleep(POLL_MS);
-    }
-    throw new Error('Generation did not complete within 5 minutes');
-  }
-
-  async function runPrompt(prompt) {
-    const beforeCount = await submitPrompt(prompt);
-    await waitForGenerationStart(beforeCount);
-    const output = await waitForGenerationEnd();
-    if (!output) throw new Error('Empty output captured');
-    return output;
-  }
-
-  // Two-phase variant for background-tab parallel mode:
-  // Phase 1 (needs document focus): submit + wait for first token to appear.
-  // Phase 2 (no focus needed): poll until text stabilizes.
-  let pendingPhase2 = null;
-
+  // "Fire and return" — only await submitPrompt (which inserts text + clicks
+  // send + verifies input). DON'T await for first token here: providers like
+  // DeepSeek do SPA nav immediately on send, which kills the content script
+  // mid-await and closes the message channel before sendResponse fires.
+  // SW-side pollFrameUntilStable handles "no text appeared" via its 90s
+  // first-text timeout.
   async function submitAndWaitStart(prompt, skipInput) {
-    // "Fire and return" — only await submitPrompt (which inserts text + clicks
-    // send + verifies input). DON'T await waitForGenerationStart here:
-    // providers like DeepSeek do SPA nav immediately on send, which kills the
-    // content script mid-await and closes the message channel before
-    // sendResponse fires. Phase 3 (SW-side pollFrameUntilStable) catches
-    // "submission silently failed" via its 90s first-text timeout.
-    const beforeCount = await submitPrompt(prompt, skipInput);
-    pendingPhase2 = { active: true, beforeCount };
-  }
-
-  async function waitForOutput() {
-    if (!pendingPhase2) throw new Error('No active submission to wait on');
-    try {
-      const output = await waitForGenerationEnd();
-      if (!output) throw new Error('Empty output captured');
-      return output;
-    } finally {
-      pendingPhase2 = null;
-    }
+    await submitPrompt(prompt, skipInput);
   }
 
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-    if (msg.type === 'PING') {
-      sendResponse({ ok: true, provider: config.id });
-      return;
-    }
-    if (msg.type === 'ENSURE_NEW_CHAT') {
-      ensureNewChat()
-        .then(() => sendResponse({ ok: true }))
-        .catch(err => sendResponse({ ok: false, error: err.message ?? String(err) }));
-      return true;
-    }
-    if (msg.type === 'RUN_PROMPT') {
-      runPrompt(msg.prompt)
-        .then(output => sendResponse({ ok: true, output }))
-        .catch(err => sendResponse({ ok: false, error: err.message ?? String(err) }));
-      return true;
-    }
     if (msg.type === 'SUBMIT_AND_WAIT_START') {
       submitAndWaitStart(msg.prompt, msg.skipInput)
         .then(() => sendResponse({ ok: true }))
-        .catch(err => sendResponse({ ok: false, error: err.message ?? String(err) }));
-      return true;
-    }
-    if (msg.type === 'WAIT_FOR_OUTPUT') {
-      waitForOutput()
-        .then(output => sendResponse({ ok: true, output }))
         .catch(err => sendResponse({ ok: false, error: err.message ?? String(err) }));
       return true;
     }
@@ -885,8 +791,7 @@
       } : null,
       assistantMessageCount: messages.length,
       latestMessagePreview: messages[messages.length - 1]?.innerText?.slice(0, 200) ?? null,
-      streaming: isStreaming(),
-      pendingPhase2: !!pendingPhase2
+      streaming: isStreaming()
     };
   }
 })();
