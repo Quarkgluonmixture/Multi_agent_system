@@ -979,7 +979,7 @@ async function pollFrameUntilStable(gridTabId, frameId, signal, onPartial) {
         return state.text;
       }
       if (!state.text && elapsed > FIRST_TEXT_TIMEOUT_MS) {
-        throw new Error('No assistant text appeared within 90s');
+        throw new Error(`No assistant text appeared within ${Math.round(FIRST_TEXT_TIMEOUT_MS/1000)}s`);
       }
     }
 

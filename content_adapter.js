@@ -789,6 +789,22 @@
         label: newChatBtn.getAttribute('aria-label'),
         testId: newChatBtn.getAttribute('data-test-id')
       } : null,
+      // Gemini-specific: dump which temp-chat / new-chat selectors match,
+      // so we can tell whether autoInit's ensureNewChat is actually finding
+      // the temporary-chat button and clicking it (i.e., is Gemini still
+      // saving every conversation to history?).
+      geminiTempChatHints: config.id !== 'gemini' ? null : {
+        tempBtnByTestId: !!document.querySelector('[data-test-id="temp-chat-button"]'),
+        tempBtnByAriaCN: !!document.querySelector('button[aria-label="临时对话"]'),
+        tempBtnByAriaEN: !!document.querySelector('button[aria-label*="Temporary" i]'),
+        newBtnByTestId: !!document.querySelector('[data-test-id="new-chat-button"]'),
+        urlHasChatId: /\/app\/[a-z0-9]+/i.test(window.location.pathname),
+        // Sample first few aria-labels to spot what's around
+        sampleLabels: Array.from(document.querySelectorAll('button[aria-label],[role="button"][aria-label]'))
+          .slice(0, 12)
+          .map(b => b.getAttribute('aria-label')?.slice(0, 30))
+          .filter(Boolean)
+      },
       assistantMessageCount: messages.length,
       latestMessagePreview: messages[messages.length - 1]?.innerText?.slice(0, 200) ?? null,
       streaming: isStreaming()

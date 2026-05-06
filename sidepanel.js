@@ -870,7 +870,9 @@ document.addEventListener('fullscreenchange', () => {
 
 // Toggle the embedded grid section visibility via clip-path. Element
 // stays in viewport with normal computed style (avoids iframe throttling
-// and anti-bot rejection), only the clipping changes.
+// and anti-bot rejection), only the clipping changes. When showing, we
+// clip away the top ~60px so the header stays visible and clickable —
+// otherwise the grid would cover the "藏 Grid" button itself.
 const toggleGridBtn = document.getElementById('toggle-grid-btn');
 if (toggleGridBtn) {
   let visible = false;
@@ -879,7 +881,7 @@ if (toggleGridBtn) {
     if (!sec) return;
     visible = !visible;
     if (visible) {
-      sec.style.clipPath = 'inset(0)';
+      sec.style.clipPath = 'inset(64px 0 0 0)';
       sec.style.zIndex = '100';
       sec.style.pointerEvents = 'auto';
       toggleGridBtn.textContent = '藏 Grid';
@@ -1001,6 +1003,11 @@ function formatDebugMarkdown(d) {
       L.push(`  - streaming: \`${probe.streaming}\``);
       if (probe.latestMessagePreview) {
         L.push(`  - latest msg: "${probe.latestMessagePreview.slice(0, 80).replace(/\n/g, ' ')}"`);
+      }
+      if (probe.geminiTempChatHints) {
+        const g = probe.geminiTempChatHints;
+        L.push(`  - geminiTempChat: tempByTestId=${g.tempBtnByTestId} tempByAriaCN=${g.tempBtnByAriaCN} tempByAriaEN=${g.tempBtnByAriaEN} newByTestId=${g.newBtnByTestId} urlHasChatId=${g.urlHasChatId}`);
+        L.push(`  - sample aria-labels: [${(g.sampleLabels ?? []).join(' | ')}]`);
       }
     }
     L.push('');
