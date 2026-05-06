@@ -889,6 +889,16 @@ function formatDebugMarkdown(d) {
   }
   L.push('');
 
+  if (d.hijackOutcome && Object.keys(d.hijackOutcome).length > 0) {
+    L.push('## Editor API hijack outcomes');
+    L.push('');
+    const keys = Object.keys(d.hijackOutcome).sort();
+    for (const k of keys) {
+      L.push(`- \`${k}\`: ${d.hijackOutcome[k]}`);
+    }
+    L.push('');
+  }
+
   // Grid (iframe) state — the v0.22+ path
   if (d.grid) {
     L.push('## Grid tab (iframe pipeline)');

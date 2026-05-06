@@ -163,14 +163,20 @@ async function injectGeminiPromptViaQuill(gridTabId, frameId, text) {
   const MAX_ATTEMPTS = 8;
   const RETRY_DELAY_MS = 500;
   let lastErr = 'unknown';
+  let lastDiag = null;
 
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     const r = await tryInjectQuillOnce(gridTabId, frameId, text);
     if (r?.ok) return r;
     lastErr = r?.error ?? 'no result';
+    if (r?.diag) lastDiag = r.diag;
     await swSleep(RETRY_DELAY_MS);
   }
-  return { ok: false, error: `Quill not ready after ${MAX_ATTEMPTS} attempts: ${lastErr}` };
+  return {
+    ok: false,
+    error: `Quill not ready after ${MAX_ATTEMPTS} attempts: ${lastErr}`,
+    diag: lastDiag
+  };
 }
 
 async function tryInjectQuillOnce(gridTabId, frameId, text) {
@@ -179,23 +185,66 @@ async function tryInjectQuillOnce(gridTabId, frameId, text) {
       target: { tabId: gridTabId, frameIds: [frameId] },
       world: 'MAIN',
       func: (txt) => {
+        const diag = {
+          hasQuillGlobal: !!window.Quill,
+          qlEditorFound: !!document.querySelector('.ql-editor'),
+          richTextareaFound: !!document.querySelector('rich-textarea'),
+          contentEditableCount: document.querySelectorAll('[contenteditable="true"]').length,
+          editorInputClass: null,
+          foundVia: null,
+          quillKeys: null
+        };
+
+        // The .ql-editor element is the Scroll *blot*. The Quill *instance* is
+        // attached to the .ql-container parent. Quill.find(scrollEl) returns
+        // the blot, not the instance — so we have to find the container.
+        const isQuillInstance = (obj) =>
+          obj && (
+            typeof obj.setText === 'function' ||
+            typeof obj.insertText === 'function' ||
+            typeof obj.setContents === 'function' ||
+            (obj.clipboard && typeof obj.clipboard.dangerouslyPasteHTML === 'function')
+          );
+
         // Find Quill instance — try multiple known patterns
         const findQuill = () => {
-          // 1. Global Quill.find()
+          // 0. Quill.find() on the .ql-container (correct way to get instance)
+          if (window.Quill && window.Quill.find) {
+            const container = document.querySelector('.ql-container');
+            if (container) {
+              const q = window.Quill.find(container);
+              if (isQuillInstance(q)) { diag.foundVia = 'Quill.find(container)'; return q; }
+              if (q && !diag.containerFindResult) {
+                diag.containerFindResult = q.constructor?.name + ':' + Object.keys(q).slice(0, 8).join(',');
+              }
+            }
+          }
+          // 1. Quill.find() on .ql-editor (likely returns Scroll blot, but try)
           if (window.Quill && window.Quill.find) {
             const ed = document.querySelector('.ql-editor');
             if (ed) {
               const q = window.Quill.find(ed);
-              if (q) return q;
+              if (isQuillInstance(q)) { diag.foundVia = 'Quill.find(editor)'; return q; }
+            }
+          }
+          // 1b. Walk up from .ql-editor calling Quill.find at each ancestor
+          if (window.Quill && window.Quill.find) {
+            let node = document.querySelector('.ql-editor');
+            for (let i = 0; i < 6 && node; i++) {
+              const q = window.Quill.find(node);
+              if (isQuillInstance(q)) { diag.foundVia = `Quill.find(ancestor@${i})`; return q; }
+              node = node.parentElement;
             }
           }
           // 2. Walk up from .ql-editor checking for instance properties
           const editor = document.querySelector('.ql-editor');
           if (editor) {
+            diag.editorInputClass = editor.className?.slice(0, 100) ?? null;
             let node = editor;
             for (let i = 0; i < 6 && node; i++) {
               for (const key of ['__quill', '_quill', 'quill']) {
-                if (node[key] && typeof node[key].insertText === 'function') {
+                if (isQuillInstance(node[key])) {
+                  diag.foundVia = `walk@${i}/${key}`;
                   return node[key];
                 }
               }
@@ -205,32 +254,378 @@ async function tryInjectQuillOnce(gridTabId, frameId, text) {
           // 3. Check rich-textarea web component
           const rt = document.querySelector('rich-textarea');
           if (rt) {
+            diag.rtKeys = Object.keys(rt).filter(k => !k.startsWith('__react')).slice(0, 20).join(',');
             for (const key of ['__quill', '_quill', 'quill', '_editor', 'editor']) {
               const obj = rt[key];
-              if (obj && typeof obj.insertText === 'function') return obj;
-              if (obj && obj._quill && typeof obj._quill.insertText === 'function') return obj._quill;
-              if (obj && obj.__quill && typeof obj.__quill.insertText === 'function') return obj.__quill;
+              if (isQuillInstance(obj)) { diag.foundVia = `rt/${key}`; return obj; }
+              if (isQuillInstance(obj?._quill)) { diag.foundVia = `rt/${key}._quill`; return obj._quill; }
+              if (isQuillInstance(obj?.__quill)) { diag.foundVia = `rt/${key}.__quill`; return obj.__quill; }
             }
           }
           return null;
         };
 
         const quill = findQuill();
-        if (!quill) return { ok: false, error: 'no Quill instance found' };
+        if (!quill) return { ok: false, error: 'no Quill instance found', diag };
+        diag.quillKeys = Object.keys(quill).slice(0, 20).join(',');
+
+        // Dump all callable methods up the prototype chain so we can see what
+        // API is actually exposed (Gemini may have stripped/renamed methods).
+        const allMethods = new Set();
+        let proto = quill;
+        for (let i = 0; i < 6 && proto && proto !== Object.prototype; i++) {
+          for (const k of Object.getOwnPropertyNames(proto)) {
+            try { if (typeof quill[k] === 'function') allMethods.add(k); }
+            catch (_) {}
+          }
+          proto = Object.getPrototypeOf(proto);
+        }
+        diag.quillMethods = [...allMethods].slice(0, 60).join(',');
+        diag.quillCtor = quill.constructor?.name ?? null;
+        diag.hasSetText = typeof quill.setText === 'function';
+        diag.hasInsertText = typeof quill.insertText === 'function';
+        diag.hasSetContents = typeof quill.setContents === 'function';
+        diag.hasUpdateContents = typeof quill.updateContents === 'function';
+        diag.hasClipboard = !!quill.clipboard;
+        diag.hasScroll = !!quill.scroll && typeof quill.scroll.insertAt === 'function';
+
+        // We only accept methods that go through Quill's normal event pipeline
+        // (so framework subscribers see the change and the send button enables).
+        // scroll.insertAt was tried but bypasses events → host React doesn't
+        // see the text → send button stays disabled → click does nothing.
+        // CRITICAL: pass source='user' on every API call. Default 'api' source
+        // is filtered by many React integrations (including Gemini's) to avoid
+        // feedback loops — they only update state on 'user' source. Without
+        // this, setText fires text-change with source='api', Gemini ignores it,
+        // send button stays disabled, click does nothing.
+        const SOURCE = 'user';
+        const setSelectionEnd = () => {
+          try {
+            const len = typeof quill.getLength === 'function' ? quill.getLength() : (txt.length + 1);
+            if (typeof quill.setSelection === 'function') {
+              quill.setSelection(len - 1, 0, SOURCE);
+            }
+          } catch (_) {}
+        };
 
         try {
           if (typeof quill.setText === 'function') {
-            quill.setText(txt + '\n');
-            return { ok: true, method: 'setText' };
+            quill.setText(txt + '\n', SOURCE);
+            setSelectionEnd();
+            return { ok: true, method: 'setText/user', diag };
           }
           if (typeof quill.insertText === 'function') {
-            quill.insertText(0, txt);
-            return { ok: true, method: 'insertText' };
+            // Clear first if there's existing content
+            if (typeof quill.deleteText === 'function' && typeof quill.getLength === 'function') {
+              try { quill.deleteText(0, quill.getLength(), SOURCE); } catch (_) {}
+            }
+            quill.insertText(0, txt, SOURCE);
+            setSelectionEnd();
+            return { ok: true, method: 'insertText/user', diag };
+          }
+          if (typeof quill.setContents === 'function') {
+            quill.setContents([{ insert: txt + '\n' }], SOURCE);
+            setSelectionEnd();
+            return { ok: true, method: 'setContents/user', diag };
+          }
+          if (quill.clipboard && typeof quill.clipboard.dangerouslyPasteHTML === 'function') {
+            const escaped = txt
+              .replace(/&/g, '&amp;')
+              .replace(/</g, '&lt;')
+              .replace(/>/g, '&gt;')
+              .replace(/\n/g, '<br>');
+            quill.clipboard.dangerouslyPasteHTML(0, '<p>' + escaped + '</p>', SOURCE);
+            setSelectionEnd();
+            return { ok: true, method: 'clipboard.dangerouslyPasteHTML', diag };
           }
         } catch (err) {
-          return { ok: false, error: err.message ?? String(err) };
+          return { ok: false, error: err.message ?? String(err), diag };
         }
-        return { ok: false, error: 'no setText/insertText method' };
+        return { ok: false, error: 'no event-firing injection method on Quill', diag };
+      },
+      args: [text]
+    });
+    return res?.result ?? { ok: false, error: 'no result from executeScript' };
+  } catch (err) {
+    return { ok: false, error: err.message ?? String(err) };
+  }
+}
+
+// ChatGPT-specific: inject prompt via the rich-text editor's internal API
+// (ProseMirror EditorView, or Lexical setEditorState). This bypasses the
+// focus + execCommand requirement that fails when the iframe doesn't have
+// real document focus, which is the blocker for moving grid into a
+// background/minimized window.
+async function injectChatGPTPromptViaEditor(gridTabId, frameId, text) {
+  const MAX_ATTEMPTS = 8;
+  const RETRY_DELAY_MS = 500;
+  let lastErr = 'unknown';
+  let lastDiag = null;
+
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    const r = await tryInjectChatGPTOnce(gridTabId, frameId, text);
+    if (r?.ok) return r;
+    lastErr = r?.error ?? 'no result';
+    if (r?.diag) lastDiag = r.diag;
+    await swSleep(RETRY_DELAY_MS);
+  }
+  return {
+    ok: false,
+    error: `ChatGPT editor not ready after ${MAX_ATTEMPTS} attempts: ${lastErr}`,
+    diag: lastDiag
+  };
+}
+
+async function tryInjectChatGPTOnce(gridTabId, frameId, text) {
+  try {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId: gridTabId, frameIds: [frameId] },
+      world: 'MAIN',
+      func: async (txt) => {
+        // Diagnostic data attached to result so we can debug hijack failures
+        // without needing extra probes.
+        const diag = { tried: [], editorTag: null, editorClass: null, fiberKey: null };
+
+        const editorEl = document.querySelector(
+          '#prompt-textarea, .ProseMirror[contenteditable="true"], [data-lexical-editor="true"], div[contenteditable="true"]'
+        );
+        if (!editorEl) return { ok: false, error: 'editor element not found', diag };
+        diag.editorTag = editorEl.tagName;
+        diag.editorClass = editorEl.className?.slice(0, 100) ?? null;
+        diag.editorId = editorEl.id || null;
+        diag.editorContentEditable = editorEl.getAttribute('contenteditable');
+        diag.editorDataLexical = editorEl.getAttribute('data-lexical-editor');
+
+        // ----- Strategy 1: ProseMirror EditorView -----
+        // ChatGPT historically uses ProseMirror. Walk React fibers to find
+        // the EditorView instance — it has .dispatch and .state.tr.
+        const findPMView = (rootEl) => {
+          const isPMView = (obj) =>
+            obj && typeof obj.dispatch === 'function' &&
+            obj.state && typeof obj.state.doc === 'object' &&
+            typeof obj.state.tr === 'object';
+
+          // Direct instance properties on the editor element
+          for (const key of ['pmViewDesc', '__view', '_view', 'view']) {
+            if (isPMView(rootEl[key])) { diag.tried.push(`elProp/${key}`); return rootEl[key]; }
+            if (isPMView(rootEl[key]?.view)) { diag.tried.push(`elProp/${key}.view`); return rootEl[key].view; }
+          }
+
+          // Find a fiber-bearing element by walking up. ChatGPT mounts React
+          // on an ancestor, not on the contenteditable itself.
+          let fiberKey = null;
+          let fiberHost = rootEl;
+          let ancestorDepth = 0;
+          while (fiberHost && !fiberKey && ancestorDepth < 25) {
+            const k = Object.keys(fiberHost).find(k =>
+              k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance')
+            );
+            if (k) { fiberKey = k; break; }
+            fiberHost = fiberHost.parentElement;
+            ancestorDepth++;
+          }
+          diag.fiberKey = fiberKey ? fiberKey.slice(0, 30) : null;
+          diag.fiberAncestorDepth = ancestorDepth;
+          if (!fiberKey) return null;
+          let fiber = fiberHost[fiberKey];
+
+          // Helper: scan ANY object for PMView at common nested keys. Most
+          // critically, useRef stores its value at `.current` — that's where
+          // ProseMirror's EditorView typically lives in React apps.
+          const scanForPMView = (obj, label) => {
+            if (!obj) return null;
+            if (isPMView(obj)) { diag.tried.push(`${label}/direct`); return obj; }
+            for (const k of ['current', 'view', 'editorView', '_view', 'editor']) {
+              const v = obj[k];
+              if (isPMView(v)) { diag.tried.push(`${label}/${k}`); return v; }
+              if (v && typeof v === 'object') {
+                for (const k2 of ['view', 'current']) {
+                  if (isPMView(v[k2])) { diag.tried.push(`${label}/${k}.${k2}`); return v[k2]; }
+                }
+              }
+            }
+            return null;
+          };
+
+          const fiberTypes = [];
+          for (let depth = 0; fiber && depth < 40; depth++, fiber = fiber.return) {
+            const t = fiber.type;
+            const typeName = typeof t === 'string'
+              ? t
+              : (t?.displayName ?? t?.name ?? (typeof t === 'function' ? 'fn' : 'obj'));
+            fiberTypes.push(typeName);
+
+            // Props
+            const props = fiber.memoizedProps;
+            if (props && typeof props === 'object') {
+              for (const k of Object.keys(props)) {
+                const found = scanForPMView(props[k], `fiber@${depth}/props.${k}`);
+                if (found) return found;
+              }
+            }
+
+            // Hooks linked list — useRef stores at memoizedState.current
+            let hook = fiber.memoizedState;
+            for (let i = 0; hook && i < 40; i++, hook = hook.next) {
+              const ms = hook.memoizedState;
+              const found = scanForPMView(ms, `fiber@${depth}/hook${i}`);
+              if (found) return found;
+              if (Array.isArray(ms)) {
+                for (let idx = 0; idx < ms.length && idx < 10; idx++) {
+                  const f2 = scanForPMView(ms[idx], `fiber@${depth}/hook${i}[${idx}]`);
+                  if (f2) return f2;
+                }
+              }
+            }
+
+            // stateNode for class components
+            const sn = fiber.stateNode;
+            if (sn && typeof sn === 'object') {
+              const found = scanForPMView(sn, `fiber@${depth}/stateNode`);
+              if (found) return found;
+            }
+          }
+          diag.fiberTypes = fiberTypes.slice(0, 14).join(',');
+          return null;
+        };
+
+        const pmView = findPMView(editorEl);
+        if (pmView) {
+          try {
+            const { state } = pmView;
+            const docSize = state.doc.content.size;
+            const tr = state.tr.delete(0, docSize).insertText(txt);
+            pmView.dispatch(tr);
+            return { ok: true, method: 'prosemirror' };
+          } catch (err) {
+            return { ok: false, error: 'pm dispatch failed: ' + (err.message ?? String(err)) };
+          }
+        }
+
+        // ----- Strategy 2: Lexical -----
+        // If ChatGPT switched to Lexical, the editor element has
+        // [data-lexical-editor="true"] and an editor instance reachable via
+        // __lexicalEditor or React fiber.
+        const findLexical = (rootEl) => {
+          if (rootEl.__lexicalEditor) return rootEl.__lexicalEditor;
+          const fiberKey = Object.keys(rootEl).find(k => k.startsWith('__reactFiber'));
+          if (!fiberKey) return null;
+          let fiber = rootEl[fiberKey];
+          for (let depth = 0; fiber && depth < 30; depth++, fiber = fiber.return) {
+            const cands = [
+              fiber.memoizedProps?.editor,
+              fiber.memoizedState?.editor,
+              fiber.stateNode?.editor
+            ];
+            for (const c of cands) {
+              if (c && typeof c.parseEditorState === 'function' && typeof c.setEditorState === 'function') {
+                return c;
+              }
+            }
+          }
+          return null;
+        };
+
+        const lex = findLexical(editorEl);
+        if (lex) {
+          try {
+            const stateJson = {
+              root: {
+                children: [{
+                  type: 'paragraph',
+                  format: '',
+                  indent: 0,
+                  version: 1,
+                  direction: null,
+                  children: [{
+                    type: 'text',
+                    text: txt,
+                    format: 0,
+                    style: '',
+                    mode: 'normal',
+                    detail: 0,
+                    version: 1
+                  }]
+                }],
+                direction: null,
+                format: '',
+                indent: 0,
+                type: 'root',
+                version: 1
+              }
+            };
+            const newState = lex.parseEditorState(stateJson);
+            lex.setEditorState(newState);
+            return { ok: true, method: 'lexical' };
+          } catch (err) {
+            return { ok: false, error: 'lexical setEditorState failed: ' + (err.message ?? String(err)) };
+          }
+        }
+
+        // ----- Strategy 3: editor.pmViewDesc reverse lookup -----
+        // Some PM forks store the view on the doc-level NodeViewDesc.
+        try {
+          const desc = editorEl.pmViewDesc;
+          if (desc) {
+            for (const k of ['view', 'parent', 'editorView']) {
+              const v = desc[k];
+              if (v && typeof v.dispatch === 'function' && v.state?.doc) {
+                const { state } = v;
+                const tr = state.tr.delete(0, state.doc.content.size).insertText(txt);
+                v.dispatch(tr);
+                return { ok: true, method: 'pmViewDesc/' + k, diag };
+              }
+            }
+            diag.descKeys = Object.keys(desc).slice(0, 10).join(',');
+          } else {
+            diag.descKeys = 'no pmViewDesc';
+          }
+        } catch (err) { diag.desc3Err = err.message ?? String(err); }
+
+        // ----- Strategy 4: direct DOM mutation -----
+        // PM's domObserver watches for DOM mutations and creates matching
+        // transactions when possible. Synthetic beforeinput is filtered by
+        // isTrusted, but raw DOM changes go through MutationObserver which
+        // doesn't have that gate.
+        try {
+          const oldHTML = editorEl.innerHTML;
+          // Build PM-friendly content: a single <p> with text node.
+          // Newlines split into multiple <p> blocks.
+          const lines = txt.split('\n');
+          editorEl.innerHTML = '';
+          for (const line of lines) {
+            const p = document.createElement('p');
+            if (line.length === 0) {
+              p.appendChild(document.createElement('br'));
+            } else {
+              p.appendChild(document.createTextNode(line));
+            }
+            editorEl.appendChild(p);
+          }
+
+          // Wait up to 200ms for PM's MutationObserver to process. rAF can
+          // be throttled in non-foreground iframes, so use a setTimeout race
+          // as a safety net against hanging.
+          await new Promise(resolve => {
+            let done = false;
+            const finish = () => { if (!done) { done = true; resolve(); } };
+            requestAnimationFrame(() => requestAnimationFrame(finish));
+            setTimeout(finish, 200);
+          });
+
+          const got = editorEl.innerText ?? editorEl.textContent ?? '';
+          const wantedKey = txt.replace(/\s+/g, '').slice(0, 20);
+          if (got.replace(/\s+/g, '').includes(wantedKey)) {
+            return { ok: true, method: 'dom-mutation', diag };
+          }
+
+          // PM may have reverted. Restore old content so we don't leave the
+          // editor in a weird state — let execCommand path try afterwards.
+          editorEl.innerHTML = oldHTML;
+          diag.domMutationRead = got.slice(0, 30);
+        } catch (err) { diag.domMutationErr = err.message ?? String(err); }
+
+        return { ok: false, error: 'no PM view, no Lexical, no pmViewDesc, DOM mutation reverted', diag };
       },
       args: [text]
     });
@@ -308,7 +703,10 @@ const debugState = {
   errors: [],
   // keyed by `${stage}:${provider}`
   lastStages: {},
-  lastResults: {}
+  lastResults: {},
+  // Records whether each provider's editor-API hijack succeeded (e.g.
+  // ChatGPT ProseMirror, Gemini Quill). "ok/<method>" or "fail:<reason>".
+  hijackOutcome: {}
 };
 
 // Persist debug state across SW restarts — chrome.storage.session survives
@@ -323,6 +721,7 @@ const DEBUG_STORE_KEY = 'debugState';
       if (Array.isArray(stored.errors)) debugState.errors = stored.errors;
       if (stored.lastStages) debugState.lastStages = stored.lastStages;
       if (stored.lastResults) debugState.lastResults = stored.lastResults;
+      if (stored.hijackOutcome) debugState.hijackOutcome = stored.hijackOutcome;
     }
   } catch (_) {}
   // Rehydrate gridTabId in case SW restarted but the grid tab is still open.
@@ -364,6 +763,7 @@ function schedulePersistDebug() {
       errors: debugState.errors,
       lastStages: debugState.lastStages,
       lastResults: debugState.lastResults,
+      hijackOutcome: debugState.hijackOutcome,
       gridTabIdSnapshot: gridTabId
     }}).catch(() => {});
   } catch (_) {}
@@ -414,6 +814,7 @@ async function collectDebug() {
     extension: chrome.runtime.getManifest()?.version ?? '?',
     userAgent: (typeof navigator !== 'undefined' && navigator.userAgent) || '?',
     errors: [...debugState.errors].reverse(),
+    hijackOutcome: { ...(debugState.hijackOutcome ?? {}) },
     providerStates: {},
     grid: {
       gridTabId: gridTabId ?? null,
@@ -557,10 +958,26 @@ async function runStage({ providers, prompts, stage, signal }) {
         }
       } catch (_) {}
 
-      // Gemini Quill API hijack (focus-independent, retried internally)
+      // Editor API hijacks — focus-independent injection. If hijack succeeds,
+      // pass skipInput so submitPrompt only verifies + clicks send (doesn't
+      // try execCommand which needs document focus).
+      //   Gemini → Quill
+      //   ChatGPT → ProseMirror EditorView (or Lexical if they switched)
       let skipInput = false;
+      const recordHijack = (r) => {
+        debugState.hijackOutcome ??= {};
+        const summary = r?.ok ? `ok/${r.method}` : `fail:${r?.error ?? 'unknown'}`;
+        const diagStr = r?.diag ? ` | diag=${JSON.stringify(r.diag)}` : '';
+        debugState.hijackOutcome[`${stage}:${provider}`] = summary + diagStr;
+        schedulePersistDebug();
+      };
       if (provider === 'gemini') {
         const r = await injectGeminiPromptViaQuill(gridTabId, frameId, prompts[provider]);
+        recordHijack(r);
+        if (r?.ok) skipInput = true;
+      } else if (provider === 'chatgpt') {
+        const r = await injectChatGPTPromptViaEditor(gridTabId, frameId, prompts[provider]);
+        recordHijack(r);
         if (r?.ok) skipInput = true;
       }
 
