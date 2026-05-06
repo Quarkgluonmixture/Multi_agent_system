@@ -136,6 +136,31 @@
       transition: background-color var(--transition), color var(--transition);
       -webkit-font-smoothing: antialiased;
     }
+    /* Stacking layers (bottom to top):
+         z-index 0: bg-grid-section (4 AI iframes — fully rendered, IO
+                    sees them as intersecting → no throttling)
+         z-index 1: solid opaque cover (this ::before pseudo-element on
+                    body — full viewport, var(--bg) color)
+         z-index 2: chat UI elements (some have semi-transparent backgrounds
+                    like the v0.53 backdrop-blur header; the cover beneath
+                    means they composite over solid color, not iframes)
+    */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background: var(--bg);
+      z-index: 1;
+      pointer-events: none;
+    }
+    body > .header,
+    body > .provider-bar,
+    body > .messages,
+    body > .input-bar,
+    body > .footer-hint {
+      position: relative;
+      z-index: 2;
+    }
 
     /* ===== Header & Bar ===== */
     .header {
@@ -696,6 +721,23 @@
       border-top: 1px solid var(--border-soft);
     }
 
+    /* ===== Embedded grid iframes ===== */
+    /* Reverted v0.60's scale-up trick — it didn't help Gemini's 临时对话
+       (which is gated on iframe context, not viewport width) and combined
+       with clip-path it made Chrome throttle CG/DS iframes much harder
+       (user had to manually reveal grid to make them load). */
+    .bg-cell {
+      width: 100%;
+      height: 100%;
+    }
+    .bg-cell iframe {
+      width: 100%;
+      height: 100%;
+      border: 0;
+      background: white;
+      display: block;
+    }
+
     /* ===== Pipeline Animator ===== */
     #pipeline-animator {
       position: relative;
@@ -888,7 +930,7 @@
 </head>
 <body>
   <div class="header">
-    <h1>Multi AI Chat · v0.59</h1>
+    <h1>Multi AI Chat · v0.65</h1>
     <div class="actions">
       <button id="fullscreen-btn" title="进入全屏（再点退出）">全屏</button>
       <button id="toggle-grid-btn" title="显示 / 隐藏底部的 4 个 AI iframe（debug 用）">看 Grid</button>
@@ -947,21 +989,27 @@
          - opacity:0          → broke Gemini submit (anti-bot)
          - left:-2000px       → off-viewport slowed CG/DS again
        clip-path:inset(100%) is the four-quadrant winner. -->
+  <!-- Embedded grid iframes. Positioned in normal viewport coordinates (so
+       Chrome's IntersectionObserver sees them as fully intersecting and
+       doesn't throttle their rendering / SSE callback delivery — that
+       throttling is what made CG/DS appear stuck until the user opened the
+       grid). The chat UI sits on top with z-index:1 + opaque background,
+       hiding the iframes from view. -->
   <div id="bg-grid-section" style="
     position: fixed;
     top: 0;
     left: 0;
     width: 1280px;
     height: 900px;
-    clip-path: inset(100%);
+    z-index: 0;
     pointer-events: none;
     background: #18181b;
   ">
     <div style="display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 2px; width: 100%; height: 100%;">
-      <iframe id="cg" data-provider="chatgpt" src="https://chatgpt.com/?temporary-chat=true" style="width:100%;height:100%;border:0;background:white;"></iframe>
-      <iframe id="g" data-provider="gemini" src="https://gemini.google.com/app" style="width:100%;height:100%;border:0;background:white;"></iframe>
-      <iframe id="ds" data-provider="deepseek" src="https://chat.deepseek.com/" style="width:100%;height:100%;border:0;background:white;"></iframe>
-      <iframe id="km" data-provider="kimi" src="https://www.kimi.com/" style="width:100%;height:100%;border:0;background:white;"></iframe>
+      <div class="bg-cell"><iframe id="cg" data-provider="chatgpt" src="https://chatgpt.com/?temporary-chat=true"></iframe></div>
+      <div class="bg-cell"><iframe id="g" data-provider="gemini" src="https://gemini.google.com/app"></iframe></div>
+      <div class="bg-cell"><iframe id="ds" data-provider="deepseek" src="https://chat.deepseek.com/"></iframe></div>
+      <div class="bg-cell"><iframe id="km" data-provider="kimi" src="https://www.kimi.com/"></iframe></div>
     </div>
   </div>
 

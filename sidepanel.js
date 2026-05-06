@@ -880,11 +880,9 @@ document.addEventListener('fullscreenchange', () => {
   }
 });
 
-// Toggle the embedded grid section visibility via clip-path. Element
-// stays in viewport with normal computed style (avoids iframe throttling
-// and anti-bot rejection), only the clipping changes. When showing, we
-// clip away the top ~60px so the header stays visible and clickable —
-// otherwise the grid would cover the "藏 Grid" button itself.
+// Toggle the embedded grid section visibility by raising z-index above
+// the chat UI cover (which sits at z-index:1) and the chat UI (z-index:2).
+// Default: grid at z-index:0, hidden behind everything.
 const toggleGridBtn = document.getElementById('toggle-grid-btn');
 if (toggleGridBtn) {
   let visible = false;
@@ -893,14 +891,18 @@ if (toggleGridBtn) {
     if (!sec) return;
     visible = !visible;
     if (visible) {
-      sec.style.clipPath = 'inset(64px 0 0 0)';
       sec.style.zIndex = '100';
       sec.style.pointerEvents = 'auto';
+      sec.style.top = '64px';
+      sec.style.height = 'calc(100vh - 64px)';
+      sec.style.width = '100vw';
       toggleGridBtn.textContent = '藏 Grid';
     } else {
-      sec.style.clipPath = 'inset(100%)';
-      sec.style.zIndex = 'auto';
+      sec.style.zIndex = '0';
       sec.style.pointerEvents = 'none';
+      sec.style.top = '0';
+      sec.style.height = '900px';
+      sec.style.width = '1280px';
       toggleGridBtn.textContent = '看 Grid';
     }
   });

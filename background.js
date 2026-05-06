@@ -1,24 +1,44 @@
-// Action icon click → open chat.html as tab (single-tab workspace).
-// Sidepanel is still available via right-click → "open side panel" if user
-// wants the narrow mode.
+// Action icon click → open chat.html in its own dedicated browser window.
+// Why a separate window: when chat.html shares a window with other tabs,
+// switching to another tab in that window puts chat.html (and its 4
+// embedded iframes) into visibilityState='hidden'. Chrome then queues SSE
+// callbacks until the tab becomes visible again — which manifests as
+// ChatGPT/DeepSeek "freezing" until the user looks at chat. With chat in
+// its own window, chat.html is always the active tab in that window
+// regardless of which other Chrome window the user is using.
 chrome.sidePanel
   .setPanelBehavior({ openPanelOnActionClick: false })
   .catch(console.error);
 
-chrome.action.onClicked.addListener(async () => {
+async function openOrFocusChatWindow() {
+  const chatUrl = chrome.runtime.getURL('chat.html');
+  const tabs = await chrome.tabs.query({});
+  const existing = tabs.find(t => t.url === chatUrl || t.url?.startsWith(chatUrl + '#'));
+  if (existing) {
+    await chrome.tabs.update(existing.id, { active: true });
+    try {
+      // Re-maximize in case it was minimized/restored
+      await chrome.windows.update(existing.windowId, { focused: true, state: 'maximized' });
+    } catch (_) {}
+    return existing.id;
+  }
+  // Two-step: chrome.windows.create rejects `state` together with bounds,
+  // so create with bounds first, then update to maximized.
+  const win = await chrome.windows.create({
+    url: chatUrl,
+    type: 'normal',
+    focused: true,
+    width: 1200,
+    height: 900
+  });
   try {
-    const chatUrl = chrome.runtime.getURL('chat.html');
-    const tabs = await chrome.tabs.query({});
-    const existing = tabs.find(t => t.url === chatUrl || t.url?.startsWith(chatUrl + '#'));
-    if (existing) {
-      await chrome.tabs.update(existing.id, { active: true });
-      try {
-        await chrome.windows.update(existing.windowId, { focused: true });
-      } catch (_) {}
-    } else {
-      await chrome.tabs.create({ url: chatUrl, active: true });
-    }
+    await chrome.windows.update(win.id, { state: 'maximized' });
   } catch (_) {}
+  return win.tabs?.[0]?.id ?? null;
+}
+
+chrome.action.onClicked.addListener(async () => {
+  try { await openOrFocusChatWindow(); } catch (_) {}
 });
 
 const PROVIDERS = {
@@ -88,9 +108,20 @@ async function getOrCreateGridTab() {
       }
     }
   } catch (_) {}
-  // None open — create chat.html as a new tab (current window, inactive).
-  const tab = await chrome.tabs.create({ url: chatUrl, active: false });
-  gridTabId = tab.id;
+  // None open — create chat.html in its own dedicated browser window so
+  // the user can browse other tabs without throttling chat's iframes.
+  // Two-step (bounds, then maximize) — Chrome rejects state+bounds combo.
+  const win = await chrome.windows.create({
+    url: chatUrl,
+    type: 'normal',
+    focused: true,
+    width: 1200,
+    height: 900
+  });
+  try {
+    await chrome.windows.update(win.id, { state: 'maximized' });
+  } catch (_) {}
+  gridTabId = win.tabs?.[0]?.id ?? null;
   schedulePersistDebug();
   return gridTabId;
 }
@@ -1676,25 +1707,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
   if (msg.type === 'OPEN_CHAT_TAB') {
-    // Open the chat.html workspace tab (the v0.46 single-tab UI).
+    // Open chat in dedicated browser window — see openOrFocusChatWindow comment.
     (async () => {
       try {
-        const chatUrl = chrome.runtime.getURL('chat.html');
-        const tabs = await chrome.tabs.query({});
-        const existing = tabs.find(t => t.url === chatUrl || t.url?.startsWith(chatUrl + '#'));
-        if (existing) {
-          await chrome.tabs.update(existing.id, { active: true });
-          try {
-            await chrome.windows.update(existing.windowId, { focused: true });
-          } catch (_) {}
-          gridTabId = existing.id;
-          sendResponse({ ok: true, reused: true, tabId: existing.id });
-          return;
+        const tabId = await openOrFocusChatWindow();
+        if (tabId != null) {
+          gridTabId = tabId;
+          schedulePersistDebug();
         }
-        const tab = await chrome.tabs.create({ url: chatUrl, active: true });
-        gridTabId = tab.id;
-        schedulePersistDebug();
-        sendResponse({ ok: true, tabId: tab.id });
+        sendResponse({ ok: true, tabId });
       } catch (err) {
         sendResponse({ ok: false, error: err.message ?? String(err) });
       }
