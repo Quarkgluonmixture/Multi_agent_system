@@ -155,6 +155,247 @@ async function reloadProviderFrame(gridTabId, provider) {
   if (!ready) await swSleep(1500);
 }
 
+// Kimi-specific: direct Lexical injection. Kimi's input is a Lexical
+// editor (Meta's framework) wrapped in Vue. The Lexical editor instance
+// is attached directly to the contenteditable element as
+// `__lexicalEditor` — no fiber walk needed (Vue ≠ React).
+async function injectKimiPromptViaLexical(gridTabId, frameId, text) {
+  const MAX_ATTEMPTS = 8;
+  const RETRY_DELAY_MS = 500;
+  let lastErr = 'unknown';
+  let lastDiag = null;
+
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    const r = await tryInjectKimiOnce(gridTabId, frameId, text);
+    if (r?.ok) return r;
+    lastErr = r?.error ?? 'no result';
+    if (r?.diag) lastDiag = r.diag;
+    await swSleep(RETRY_DELAY_MS);
+  }
+  return {
+    ok: false,
+    error: `Kimi Lexical not ready after ${MAX_ATTEMPTS} attempts: ${lastErr}`,
+    diag: lastDiag
+  };
+}
+
+async function tryInjectKimiOnce(gridTabId, frameId, text) {
+  try {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId: gridTabId, frameIds: [frameId] },
+      world: 'MAIN',
+      func: async (txt) => {
+        const diag = {};
+        const editorEl = document.querySelector(
+          'div[contenteditable="true"][data-lexical-editor="true"], ' +
+          'div[contenteditable="true"][role="textbox"], ' +
+          'div[contenteditable="true"]'
+        );
+        if (!editorEl) return { ok: false, error: 'no editor element', diag };
+        diag.editorClass = editorEl.className?.slice(0, 60) ?? null;
+        diag.dataLexical = editorEl.getAttribute('data-lexical-editor');
+
+        // Strategy 1: __lexicalEditor.setEditorState
+        const lex = editorEl.__lexicalEditor;
+        diag.hasLexEditor = !!lex;
+        if (lex) {
+          diag.lexMethods = ['parseEditorState', 'setEditorState', 'update', 'dispatchCommand', 'focus']
+            .filter(m => typeof lex[m] === 'function')
+            .join(',');
+          if (typeof lex.parseEditorState === 'function' &&
+              typeof lex.setEditorState === 'function') {
+            try {
+              const lines = txt.split('\n');
+              const stateJson = {
+                root: {
+                  children: lines.map(line => ({
+                    type: 'paragraph',
+                    format: '',
+                    indent: 0,
+                    version: 1,
+                    direction: null,
+                    textFormat: 0,
+                    children: line.length === 0 ? [] : [{
+                      type: 'text',
+                      text: line,
+                      format: 0,
+                      style: '',
+                      mode: 'normal',
+                      detail: 0,
+                      version: 1
+                    }]
+                  })),
+                  direction: null, format: '', indent: 0, type: 'root', version: 1
+                }
+              };
+              const newState = lex.parseEditorState(stateJson);
+              lex.setEditorState(newState);
+              await new Promise(r => setTimeout(r, 80));
+              const got = editorEl.innerText ?? editorEl.textContent ?? '';
+              const wantedKey = txt.replace(/\s+/g, '').slice(0, 20);
+              if (got.replace(/\s+/g, '').includes(wantedKey)) {
+                return { ok: true, method: 'lexical/setEditorState', diag };
+              }
+              diag.lexRead = got.slice(0, 30);
+            } catch (err) {
+              diag.lexErr = err.message ?? String(err);
+            }
+          }
+        }
+
+        // Strategy 2: DOM mutation fallback (same trick that works for PM)
+        try {
+          const oldHTML = editorEl.innerHTML;
+          const lines = txt.split('\n');
+          editorEl.innerHTML = '';
+          for (const line of lines) {
+            const p = document.createElement('p');
+            if (line.length === 0) p.appendChild(document.createElement('br'));
+            else p.appendChild(document.createTextNode(line));
+            editorEl.appendChild(p);
+          }
+          await new Promise(resolve => {
+            let done = false;
+            const finish = () => { if (!done) { done = true; resolve(); } };
+            requestAnimationFrame(() => requestAnimationFrame(finish));
+            setTimeout(finish, 200);
+          });
+          const got = editorEl.innerText ?? editorEl.textContent ?? '';
+          const wantedKey = txt.replace(/\s+/g, '').slice(0, 20);
+          if (got.replace(/\s+/g, '').includes(wantedKey)) {
+            return { ok: true, method: 'dom-mutation', diag };
+          }
+          editorEl.innerHTML = oldHTML;
+          diag.domRead = got.slice(0, 30);
+        } catch (err) {
+          diag.domErr = err.message ?? String(err);
+        }
+
+        return { ok: false, error: 'all Kimi strategies failed', diag };
+      },
+      args: [text]
+    });
+    return res?.result ?? { ok: false, error: 'no result from executeScript' };
+  } catch (err) {
+    return { ok: false, error: err.message ?? String(err) };
+  }
+}
+
+// Kimi reconnaissance probe — dumps editor DOM + framework hints + React
+// fiber chain + window globals to diag. Doesn't modify anything. Lets us
+// see what framework Kimi uses so we can write a hijack for it.
+async function probeKimiEditor(gridTabId, frameId) {
+  try {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId: gridTabId, frameIds: [frameId] },
+      world: 'MAIN',
+      func: () => {
+        const out = { ts: Date.now() };
+        // Find the input element — Kimi uses contenteditable or textbox role
+        const inputEl = document.querySelector(
+          'div[contenteditable="true"][role="textbox"], div[contenteditable="true"], textarea, [role="textbox"]'
+        );
+        if (!inputEl) return { error: 'no input element found' };
+
+        out.tag = inputEl.tagName;
+        out.id = inputEl.id || null;
+        out.className = (inputEl.className?.slice?.(0, 200)) ?? null;
+        out.contentEditable = inputEl.getAttribute('contenteditable');
+        out.role = inputEl.getAttribute('role');
+        out.dataAttrs = {};
+        for (const a of inputEl.attributes) {
+          if (a.name.startsWith('data-')) out.dataAttrs[a.name] = a.value.slice(0, 50);
+        }
+
+        // Own props (filter out React fiber/props keys for readability)
+        out.ownKeys = Object.keys(inputEl)
+          .filter(k => !k.startsWith('__react'))
+          .slice(0, 30);
+
+        // Check for known editor framework hints on element + ancestors
+        const frameworks = [];
+        let node = inputEl;
+        for (let i = 0; i < 8 && node; i++) {
+          const cls = node.className?.toString?.() ?? '';
+          if (cls.includes('ql-')) frameworks.push(`quill@${i}:${cls.slice(0, 60)}`);
+          if (cls.includes('ProseMirror')) frameworks.push(`pm@${i}`);
+          if (cls.includes('lexical') || node.getAttribute?.('data-lexical-editor')) frameworks.push(`lexical@${i}`);
+          if (cls.includes('tiptap') || cls.includes('prosemirror')) frameworks.push(`tiptap@${i}`);
+          if (cls.includes('milkdown')) frameworks.push(`milkdown@${i}`);
+          if (cls.includes('cm-') || cls.includes('CodeMirror')) frameworks.push(`codemirror@${i}`);
+          if (cls.includes('monaco')) frameworks.push(`monaco@${i}`);
+          if (cls.includes('slate')) frameworks.push(`slate@${i}`);
+          // Editor-instance properties
+          for (const k of ['__quill', '__lexicalEditor', '__pmView', '__editor', '_editor']) {
+            if (node[k]) frameworks.push(`prop@${i}:${k}`);
+          }
+          node = node.parentElement;
+        }
+        out.frameworkHints = frameworks;
+
+        // Window globals
+        const globals = [];
+        for (const g of ['Quill', 'EditorView', 'EditorState', 'Lexical', 'createEditor', 'Tiptap', 'Slate', 'monaco', 'CodeMirror']) {
+          if (typeof window[g] !== 'undefined') globals.push(g);
+        }
+        out.windowGlobals = globals;
+
+        // React fiber walk (just record component types up to depth 20)
+        let fiberHost = inputEl;
+        let fiberKey = null;
+        for (let i = 0; i < 25 && fiberHost && !fiberKey; i++) {
+          const k = Object.keys(fiberHost).find(k => k.startsWith('__reactFiber'));
+          if (k) fiberKey = k;
+          else fiberHost = fiberHost.parentElement;
+        }
+        if (fiberKey) {
+          out.fiberKey = fiberKey.slice(0, 30);
+          let f = fiberHost[fiberKey];
+          const types = [];
+          // Also collect any props that look editor-shaped
+          const editorPropPaths = [];
+          for (let d = 0; f && d < 30; d++, f = f.return) {
+            const t = f.type;
+            const tn = typeof t === 'string'
+              ? t
+              : (t?.displayName ?? t?.name ?? (typeof t === 'function' ? 'fn' : 'obj'));
+            types.push(tn);
+            // Look for props/state with editor-suggestive shapes
+            const props = f.memoizedProps;
+            if (props && typeof props === 'object') {
+              for (const pk of Object.keys(props)) {
+                const v = props[pk];
+                if (!v || typeof v !== 'object') continue;
+                if (typeof v.dispatch === 'function' || typeof v.insertText === 'function' ||
+                    typeof v.setText === 'function' || typeof v.setEditorState === 'function') {
+                  editorPropPaths.push(`fiber@${d}/props.${pk}`);
+                }
+                if (v.current && typeof v.current === 'object' &&
+                    (typeof v.current.dispatch === 'function' || typeof v.current.insertText === 'function')) {
+                  editorPropPaths.push(`fiber@${d}/props.${pk}.current`);
+                }
+              }
+            }
+          }
+          out.fiberTypes = types.slice(0, 16).join(',');
+          out.editorPropPaths = editorPropPaths;
+        } else {
+          out.fiberKey = null;
+        }
+
+        // Sample the input's textContent / innerHTML structure
+        out.textContent = (inputEl.textContent ?? '').slice(0, 60);
+        out.innerHTMLPrefix = (inputEl.innerHTML ?? '').slice(0, 200);
+
+        return out;
+      }
+    });
+    return res?.result ?? { error: 'no result from executeScript' };
+  } catch (err) {
+    return { error: err.message ?? String(err) };
+  }
+}
+
 // Gemini-specific: inject prompt by directly calling Quill's API in the
 // iframe's main world. This bypasses the focus / execCommand requirement
 // that fails for Quill in iframes. Retries because Quill may not be
@@ -977,6 +1218,10 @@ async function runStage({ providers, prompts, stage, signal }) {
         if (r?.ok) skipInput = true;
       } else if (provider === 'chatgpt') {
         const r = await injectChatGPTPromptViaEditor(gridTabId, frameId, prompts[provider]);
+        recordHijack(r);
+        if (r?.ok) skipInput = true;
+      } else if (provider === 'kimi') {
+        const r = await injectKimiPromptViaLexical(gridTabId, frameId, prompts[provider]);
         recordHijack(r);
         if (r?.ok) skipInput = true;
       }
