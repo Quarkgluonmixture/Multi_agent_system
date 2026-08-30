@@ -533,6 +533,104 @@
       border-top: 1px solid var(--border-soft);
     }
 
+    /* ===== iPhone Relay panel ===== */
+    details.relay-panel {
+      border-bottom: 1px solid var(--border);
+      background: var(--header-bg);
+      font-size: 12px;
+      flex-shrink: 0;
+    }
+    details.relay-panel > summary {
+      cursor: pointer;
+      list-style: none;
+      padding: 6px 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--text-dim);
+      user-select: none;
+    }
+    details.relay-panel > summary::before { content: '▸ '; font-size: 10px; }
+    details.relay-panel[open] > summary::before { content: '▾ '; }
+    details.relay-panel .relay-status {
+      margin-left: auto;
+      font-size: 11px;
+      padding: 1px 8px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+    }
+    details.relay-panel .relay-status[data-running="true"] {
+      background: #10a37f; color: #fff; border-color: #0e8a6a;
+    }
+    details.relay-panel .relay-status[data-running="false"] {
+      background: var(--button-bg); color: var(--text-dim);
+    }
+    details.relay-panel .relay-body {
+      padding: 6px 12px 10px;
+      display: grid;
+      grid-template-columns: 88px 1fr;
+      gap: 6px 8px;
+      align-items: center;
+    }
+    details.relay-panel label {
+      font-size: 11px;
+      color: var(--text-dim);
+      text-align: right;
+    }
+    details.relay-panel input,
+    details.relay-panel textarea {
+      font-family: inherit;
+      font-size: 12px;
+      padding: 4px 7px;
+      border: 1px solid var(--input-border);
+      border-radius: 4px;
+      background: var(--input-bg);
+      color: var(--text);
+      outline: none;
+      width: 100%;
+      box-sizing: border-box;
+    }
+    details.relay-panel textarea { resize: vertical; min-height: 56px; max-height: 200px; }
+    details.relay-panel .relay-row-full {
+      grid-column: 1 / -1;
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+    }
+    details.relay-panel .relay-row-full .grow { flex: 1; color: var(--text-dim); font-size: 10.5px; }
+    details.relay-panel button.relay-save {
+      font-size: 11px;
+      padding: 4px 12px;
+      border: 1px solid var(--button-border);
+      background: var(--send-bg);
+      color: #fff;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    details.relay-panel button.relay-save:disabled { opacity: 0.5; cursor: default; }
+    details.relay-panel .relay-log {
+      grid-column: 1 / -1;
+      max-height: 96px;
+      overflow-y: auto;
+      background: var(--code-bg);
+      border-radius: 4px;
+      padding: 4px 6px;
+      font-family: ui-monospace, Consolas, monospace;
+      font-size: 10.5px;
+      line-height: 1.4;
+      color: var(--text-dim);
+      white-space: pre-wrap;
+    }
+    details.relay-panel .relay-checkbox {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      color: var(--text);
+      font-size: 12px;
+    }
+
     /* scrollbar styling for dark mode */
     body[data-theme="dark"] ::-webkit-scrollbar {
       width: 8px;
@@ -577,6 +675,63 @@
       </select>
     </div>
   </div>
+
+  <details class="relay-panel" id="relay-panel">
+    <summary>
+      📱 iPhone Relay <span style="opacity:0.7">· Telegram → ChatGPT → WhatsApp</span>
+      <span class="relay-status" id="relay-status" data-running="false">stopped</span>
+    </summary>
+    <div class="relay-body">
+      <label>Bot token</label>
+      <input type="password" id="relay-token" placeholder="123456:ABC..." autocomplete="off">
+
+      <label>Your TG ID</label>
+      <input type="text" id="relay-userid" placeholder="(auto on first photo)">
+
+      <label>Channel ID</label>
+      <input type="text" id="relay-channelid" placeholder="-1001234567890 (Shortcut 一键模式)">
+
+      <label>Destinations</label>
+      <div style="display:flex; gap:14px; flex-wrap:wrap;">
+        <label class="relay-checkbox" style="text-align:left;">
+          <input type="checkbox" id="relay-dest-tg" checked> Telegram (回 bot 聊天)
+        </label>
+        <label class="relay-checkbox" style="text-align:left;">
+          <input type="checkbox" id="relay-dest-wa" checked> WhatsApp
+        </label>
+      </div>
+
+      <label>WhatsApp #</label>
+      <input type="text" id="relay-waphone" placeholder="+447700900123">
+
+      <label>Prompt</label>
+      <textarea id="relay-prompt" rows="4"></textarea>
+
+      <div class="relay-row-full">
+        <label class="relay-checkbox">
+          <input type="checkbox" id="relay-enabled"> Enable poller
+        </label>
+        <label class="relay-checkbox" title="跑完后不自动关闭标签页（调试用）">
+          <input type="checkbox" id="relay-keeptabs"> 保留 tab（调试）
+        </label>
+        <span class="grow" id="relay-hint"></span>
+        <button class="relay-save" id="relay-save">保存并重启</button>
+      </div>
+
+      <div class="relay-row-full" id="relay-last-row" style="display:none;">
+        <span class="grow" id="relay-last-info" style="color:var(--text-dim); font-size:11px;"></span>
+        <button class="relay-save" id="relay-resend" style="background:var(--button-bg); color:var(--text); border:1px solid var(--button-border);" title="把最近一次 ChatGPT 答案重新发到所有目的地（不重跑 ChatGPT）">重发上次答案</button>
+        <button class="relay-save" id="relay-clear-queue" style="background:var(--button-bg); color:var(--text-dim); border:1px solid var(--button-border); font-size:10px;" title="清空待处理队列">清空队列</button>
+      </div>
+
+      <div class="relay-row-full">
+        <span class="grow" style="color:var(--text-dim); font-size:11px;">卡住时点这里：仅释放 busy 锁，队列保留并继续推进</span>
+        <button class="relay-save" id="relay-unstick" style="background:#7a3a00; color:#fff; border:1px solid #c97200; font-size:11px;" title="强制释放 busy 锁，保留队列，立即尝试推进下一条">🔓 强制解锁</button>
+      </div>
+
+      <div class="relay-log" id="relay-log">(尚未启动)</div>
+    </div>
+  </details>
 
   <div class="messages" id="messages">
     <div class="empty-hint" id="empty-hint">

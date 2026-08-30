@@ -844,6 +844,27 @@ openGridBtn?.addEventListener('click', async () => {
   }
 });
 
+// Bulk-delete Gemini history (chat.html only). Opens gemini.google.com
+// in a top-frame tab and runs a delete-all script there.
+const cleanGeminiBtn = document.getElementById('clean-gemini-btn');
+cleanGeminiBtn?.addEventListener('click', async () => {
+  if (!confirm('打开 Gemini 历史并批量删除全部对话？\n\n注意：会真的删除你所有 Gemini 历史，不可恢复。\n（执行时新 tab 会激活，你能看到 Gemini 自动一个个删）')) return;
+  cleanGeminiBtn.disabled = true;
+  cleanGeminiBtn.textContent = '清理中...';
+  try {
+    const r = await chrome.runtime.sendMessage({ type: 'CLEAN_GEMINI_HISTORY' });
+    if (r?.ok) {
+      cleanGeminiBtn.textContent = `✓ 删了 ${r.deleted ?? 0} / ${r.total ?? 0}`;
+    } else {
+      cleanGeminiBtn.textContent = `Err: ${r?.error ?? 'unknown'}`;
+    }
+  } catch (err) {
+    cleanGeminiBtn.textContent = `Err: ${err.message}`;
+  } finally {
+    setTimeout(() => { cleanGeminiBtn.textContent = '清 Gemini'; cleanGeminiBtn.disabled = false; }, 5000);
+  }
+});
+
 // Sidepanel-only: button to open the chat.html workspace tab.
 const openChatTabBtn = document.getElementById('open-chat-tab-btn');
 openChatTabBtn?.addEventListener('click', async () => {
@@ -907,6 +928,187 @@ if (toggleGridBtn) {
     }
   });
 }
+
+// =================== iPhone Relay panel (sidepanel only) ===================
+
+(function initRelayPanel() {
+  const panel = document.getElementById('relay-panel');
+  if (!panel) return; // chat.html doesn't have this panel
+
+  const tokenEl    = document.getElementById('relay-token');
+  const useridEl   = document.getElementById('relay-userid');
+  const channelEl  = document.getElementById('relay-channelid');
+  const waphoneEl  = document.getElementById('relay-waphone');
+  const promptEl   = document.getElementById('relay-prompt');
+  const enabledEl  = document.getElementById('relay-enabled');
+  const keepTabsEl = document.getElementById('relay-keeptabs');
+  const destTgEl   = document.getElementById('relay-dest-tg');
+  const destWaEl   = document.getElementById('relay-dest-wa');
+  const saveBtn    = document.getElementById('relay-save');
+  const statusEl   = document.getElementById('relay-status');
+  const hintEl     = document.getElementById('relay-hint');
+  const logEl      = document.getElementById('relay-log');
+  const lastRow    = document.getElementById('relay-last-row');
+  const lastInfo   = document.getElementById('relay-last-info');
+  const resendBtn  = document.getElementById('relay-resend');
+  const clearQBtn  = document.getElementById('relay-clear-queue');
+  const unstickBtn = document.getElementById('relay-unstick');
+
+  let pollTimer = null;
+
+  function setStatus(running) {
+    statusEl.dataset.running = running ? 'true' : 'false';
+    statusEl.textContent = running ? 'running' : 'stopped';
+  }
+
+  function renderLog(lines) {
+    if (!Array.isArray(lines) || lines.length === 0) {
+      logEl.textContent = '(no log yet)';
+      return;
+    }
+    logEl.textContent = lines.join('\n');
+  }
+
+  async function refresh() {
+    try {
+      const r = await chrome.runtime.sendMessage({ type: 'RELAY_GET_CONFIG' });
+      if (!r?.ok) return;
+      // Don't clobber the user's in-progress edits — only fill empty fields
+      // on first paint. Detect first paint by absence of dataset.loaded.
+      if (!panel.dataset.loaded) {
+        tokenEl.value   = r.config.token || '';
+        useridEl.value  = r.config.allowedUserId ?? '';
+        channelEl.value = r.config.allowedChannelId ?? '';
+        waphoneEl.value = r.config.waPhone || '';
+        promptEl.value  = r.config.prompt || '';
+        enabledEl.checked = !!r.config.enabled;
+        keepTabsEl.checked = !!r.config.keepTabs;
+        destTgEl.checked = r.config.destTelegram !== false;
+        destWaEl.checked = r.config.destWhatsapp !== false;
+        panel.dataset.loaded = '1';
+      } else {
+        // Just sync auto-detected user ID if user hasn't typed one
+        if (!useridEl.value && r.config.allowedUserId) {
+          useridEl.value = r.config.allowedUserId;
+        }
+      }
+      setStatus(r.running);
+      renderLog(r.log);
+      renderLastAnswer(r.lastAnswer, r.queueLength, r.inFlight);
+    } catch (_) {}
+  }
+
+  function renderLastAnswer(la, queueLength, inFlight) {
+    if (!la || !la.text) {
+      lastRow.style.display = 'none';
+      return;
+    }
+    lastRow.style.display = '';
+    const ageMin = Math.floor((Date.now() - la.ts) / 60000);
+    const ageLabel = ageMin < 1 ? '<1m ago' : ageMin < 60 ? `${ageMin}m ago` : `${Math.floor(ageMin/60)}h ago`;
+    const ts = new Date(la.ts).toLocaleTimeString();
+    const queueBit = queueLength > 0 ? ` · queue ${queueLength}` : '';
+    const inFlightBit = inFlight ? ' · 🔄 in flight' : '';
+    lastInfo.textContent = `上次答案 ${ts} (${ageLabel}) · ${la.text.length} chars · ${la.imageCount ?? '?'}图${queueBit}${inFlightBit}`;
+  }
+
+  resendBtn?.addEventListener('click', async () => {
+    resendBtn.disabled = true;
+    const orig = resendBtn.textContent;
+    resendBtn.textContent = '重发中…';
+    try {
+      const r = await chrome.runtime.sendMessage({ type: 'RELAY_RESEND_LAST' });
+      hintEl.textContent = r?.ok ? '✓ 已重发' : ('Err: ' + (r?.error || 'unknown'));
+    } catch (err) {
+      hintEl.textContent = 'Err: ' + (err.message ?? err);
+    } finally {
+      resendBtn.disabled = false;
+      resendBtn.textContent = orig;
+      setTimeout(() => { hintEl.textContent = ''; }, 6000);
+    }
+  });
+
+  clearQBtn?.addEventListener('click', async () => {
+    if (!confirm('清空待处理队列？（不会影响已完成的答案）')) return;
+    try {
+      const r = await chrome.runtime.sendMessage({ type: 'RELAY_CLEAR_QUEUE' });
+      hintEl.textContent = r?.ok ? '✓ 队列已清空' : ('Err: ' + (r?.error || 'unknown'));
+      refresh();
+    } catch (err) {
+      hintEl.textContent = 'Err: ' + (err.message ?? err);
+    }
+    setTimeout(() => { hintEl.textContent = ''; }, 4000);
+  });
+
+  unstickBtn?.addEventListener('click', async () => {
+    unstickBtn.disabled = true;
+    const orig = unstickBtn.textContent;
+    unstickBtn.textContent = '解锁中…';
+    try {
+      const r = await chrome.runtime.sendMessage({ type: 'RELAY_UNSTICK' });
+      if (r?.ok) {
+        hintEl.textContent = r.queueLength > 0
+          ? `✓ 已解锁 · 恢复 ${r.queueLength} 条待处理`
+          : '✓ 已解锁（队列为空）';
+      } else {
+        hintEl.textContent = 'Err: ' + (r?.error || 'unknown');
+      }
+      refresh();
+    } catch (err) {
+      hintEl.textContent = 'Err: ' + (err.message ?? err);
+    } finally {
+      unstickBtn.disabled = false;
+      unstickBtn.textContent = orig;
+      setTimeout(() => { hintEl.textContent = ''; }, 6000);
+    }
+  });
+
+  saveBtn.addEventListener('click', async () => {
+    saveBtn.disabled = true;
+    const original = saveBtn.textContent;
+    saveBtn.textContent = '保存中…';
+    hintEl.textContent = '';
+    try {
+      const patch = {
+        token:    tokenEl.value.trim(),
+        allowedUserId: useridEl.value.trim() || null,
+        allowedChannelId: channelEl.value.trim() || null,
+        waPhone:  waphoneEl.value.trim(),
+        prompt:   promptEl.value,
+        enabled:  enabledEl.checked,
+        keepTabs: keepTabsEl.checked,
+        destTelegram: destTgEl.checked,
+        destWhatsapp: destWaEl.checked
+      };
+      const r = await chrome.runtime.sendMessage({ type: 'RELAY_SET_CONFIG', patch });
+      if (!r?.ok) {
+        hintEl.textContent = 'Err: ' + (r?.error || 'unknown');
+      } else {
+        setStatus(r.running);
+        hintEl.textContent = r.running ? '✓ poller running' : (patch.enabled ? '⚠ enabled but not running' : 'saved');
+      }
+    } catch (err) {
+      hintEl.textContent = 'Err: ' + (err.message ?? err);
+    } finally {
+      saveBtn.disabled = false;
+      saveBtn.textContent = original;
+      setTimeout(() => { hintEl.textContent = ''; }, 6000);
+    }
+  });
+
+  // Refresh status + log every 4s while panel is open.
+  function tick() { refresh(); }
+  panel.addEventListener('toggle', () => {
+    if (panel.open) {
+      tick();
+      pollTimer ??= setInterval(tick, 4000);
+    } else {
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    }
+  });
+  // Initial paint (panel may already be open by default)
+  refresh();
+})();
 
 async function copyDebug() {
   const original = copyDebugBtn.textContent;

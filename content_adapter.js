@@ -316,15 +316,69 @@
     try {
       const messages = getAssistantMessages();
       const last = messages[messages.length - 1];
-      // Use the same DOM→Markdown extraction as final capture, so streaming
-      // stable-text comparison sees the same content the user will see.
-      const text = last ? domToMarkdown(last).trim() : '';
+
+      // For ChatGPT reasoning models (o-series / "Thought for X"), the
+      // assistant bubble contains BOTH a collapsed reasoning panel AND the
+      // final answer in separate children. domToMarkdown on the outer bubble
+      // gets confused by the reasoning element's collapsed/short text. Prefer
+      // a dedicated answer container when we can find one.
+      let answerEl = last;
+      if (last) {
+        const md =
+          last.querySelector('.markdown.prose') ||
+          last.querySelector('div[class*="markdown"][class*="prose"]') ||
+          last.querySelector('.markdown');
+        if (md) answerEl = md;
+      }
+      const text = answerEl ? domToMarkdown(answerEl).trim() : '';
+
+      // Detect reasoning-in-progress. For ChatGPT's o-series models, the
+      // "Thinking..." / "Thought for X" indicator lives in a sibling DOM
+      // node of the assistant message bubble (NOT inside it), so we have
+      // to search document-wide. While that indicator is present and the
+      // answer container is still tiny, treat the state as streaming so
+      // polling keeps waiting through the post-thinking render delay.
+      let reasoning = false;
+      let analyzingImages = false;
+      const REASONING_PATTERNS = /Thinking\.{1,3}|Thought for\s|思考了|正在思考|Reasoning\.{1,3}/i;
+      // "正在分析 N 幅图片" / "Analyzing image" — ChatGPT pre-answer state
+      // when processing uploads. Distinct from reasoning: this state can hang
+      // indefinitely if the vision backend errors, so the SW polls with a
+      // SHORTER patience budget when this flag is set.
+      const ANALYZING_PATTERNS = /正在分析.{0,8}(幅|张).{0,4}图|分析图片中|Analyzing image|Analyzing the image|Looking at .{0,20}image/i;
+      try {
+        const turn = last?.closest('article, [class*="turn"], [class*="message"]') || last;
+        const scope = turn?.parentElement || document;
+        const scopeText = scope?.textContent?.slice(0, 4000) || '';
+        if (REASONING_PATTERNS.test(scopeText)) {
+          const answerLen = (answerEl?.textContent?.length || 0);
+          if (answerLen < 200) reasoning = true;
+        }
+        if (ANALYZING_PATTERNS.test(scopeText)) {
+          const answerLen = (answerEl?.textContent?.length || 0);
+          if (answerLen < 200) analyzingImages = true;
+        }
+      } catch (_) {}
+
+      // ChatGPT-specific authoritative "done" signal. The assistant message
+      // bubble carries data-message-status with values like:
+      //   "streaming" — still generating
+      //   "finished_successfully" — terminal, done
+      //   "finished_partial_completion" — terminal, truncated but done
+      //   "in_progress" — older clients use this for streaming
+      // Reasoning models don't set this attribute at all — it stays null.
+      const messageStatus = last?.getAttribute?.('data-message-status') ?? null;
+
       return {
         provider: config.id,
         text,
         stopVisible: !!findStopButton(),
-        streaming: isStreaming(),
-        messageCount: messages.length
+        streaming: isStreaming() || reasoning || analyzingImages,
+        messageCount: messages.length,
+        messageStatus,
+        reasoning,
+        analyzingImages,
+        fullTextLen: last?.textContent?.length ?? 0,
       };
     } catch (err) {
       return { error: err.message ?? String(err) };
@@ -552,35 +606,39 @@
     // Gemini specifically: gemini.google.com/app auto-redirects to the most
     // recent conversation. Clicking "临时对话" while inside a saved conversation
     // doesn't put THIS chat into temp mode. We have to first click "新对话"
-    // to leave the saved conversation, then click "临时对话".
+    // to leave the saved conversation, then click "临时对话". Tight 1.5s cap
+    // — if the new-chat button isn't visible by then, we're already on the
+    // home page and don't need it.
     if (config.id === 'gemini') {
       const newChat = await waitUntil(
         () => {
           const b = document.querySelector('[data-test-id="new-chat-button"]');
           return isButtonEnabled(b) ? b : null;
         },
-        { timeoutMs: 5000, intervalMs: 250 }
+        { timeoutMs: 1500, intervalMs: 200 }
       ).catch(() => null);
       if (newChat) {
         robustClick(newChat);
-        await sleep(800);
+        await sleep(400);
       }
     }
 
-    // Now click the priority new-chat-style button. For Gemini that's the
-    // temp-chat-button (highest priority in newChatButtonSelectors). For
-    // DeepSeek it's the regular new-chat link.
+    // Now look for the priority new-chat-style button. For Gemini that's
+    // the temp-chat-button — but in iframe context Gemini hides this
+    // button entirely (anti-iframe), so waiting 10s for it is pure waste
+    // every reload (3+ rounds × ~10s = 30s+ per pipeline). Tight 2s cap:
+    // if the button doesn't appear by then, autoInit moves on without it.
     const btn = await waitUntil(
       () => {
         const b = findNewChatButton();
         return isButtonEnabled(b) ? b : null;
       },
-      { timeoutMs: 10000, intervalMs: 250 }
+      { timeoutMs: 2000, intervalMs: 200 }
     ).catch(() => null);
 
     if (!btn) return;
     robustClick(btn);
-    await sleep(1000);
+    await sleep(500);
   }
 
   function pressEnter(input) {
@@ -727,10 +785,202 @@
     await submitPrompt(prompt, skipInput);
   }
 
+  // =================== Image attachment (iPhone relay) ===================
+  // Used by the Telegram→ChatGPT→WhatsApp relay path. Converts base64 images
+  // to File objects, dispatches a paste event with them on the input, then
+  // waits for ChatGPT to show upload thumbnails before submitting. This is
+  // ChatGPT-specific for now (the relay only targets ChatGPT).
+
+  function base64ToBlob(b64, type) {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new Blob([bytes], { type });
+  }
+
+  // Find ChatGPT's hidden <input type="file"> that the "Add photos" button
+  // wires up. Pumping files directly through this input is far more reliable
+  // than synthesizing a paste event — paste handlers in modern Lexical-based
+  // composers often ignore programmatic ClipboardEvent.
+  function findChatgptFileInput() {
+    const inputs = Array.from(document.querySelectorAll('input[type="file"]'));
+    // Prefer one that explicitly accepts images.
+    return (
+      inputs.find(i => /image/i.test(i.accept || '')) ||
+      inputs[0] ||
+      null
+    );
+  }
+
+  async function attachImages(images) {
+    const editor = await waitUntil(
+      () => findInput(),
+      { timeoutMs: 30000, intervalMs: 300 }
+    );
+
+    try { window.focus(); } catch (_) {}
+    editor.focus();
+    await sleep(150);
+
+    const files = images.map(img => {
+      const blob = base64ToBlob(img.base64, img.type);
+      return new File([blob], img.name, { type: img.type });
+    });
+
+    let strategy = 'none';
+
+    // Strategy 1 (preferred): set files directly on the hidden file input
+    // using React's native setter (bypasses React's synthetic value tracking
+    // that would otherwise ignore plain assignment), then fire BOTH change
+    // and input events. This is the same pattern testing libraries use.
+    const fileInput = findChatgptFileInput();
+    if (fileInput) {
+      try {
+        const dt = new DataTransfer();
+        for (const f of files) dt.items.add(f);
+        // React's onChange wraps the native setter; setting input.files = ...
+        // directly is silently dropped on some React versions because React
+        // tracks the value separately. Use the prototype setter to be safe.
+        const nativeSetter = Object.getOwnPropertyDescriptor(
+          HTMLInputElement.prototype, 'files'
+        )?.set;
+        if (nativeSetter) {
+          nativeSetter.call(fileInput, dt.files);
+        } else {
+          fileInput.files = dt.files;
+        }
+        fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+        fileInput.dispatchEvent(new Event('input', { bubbles: true }));
+        strategy = 'file-input';
+      } catch (e) {
+        strategy = 'file-input-failed:' + (e.message ?? e);
+      }
+    }
+
+    // Strategy 2 (drop event): some ChatGPT versions wire the file picker
+    // through a drag-drop listener on the composer. Fire a real DragEvent
+    // with files in dataTransfer.
+    if (strategy !== 'file-input') {
+      try {
+        const dt = new DataTransfer();
+        for (const f of files) dt.items.add(f);
+        const dropTarget = editor.closest('form') || editor;
+        dropTarget.dispatchEvent(new DragEvent('dragenter', { bubbles: true, cancelable: true, dataTransfer: dt }));
+        dropTarget.dispatchEvent(new DragEvent('dragover',  { bubbles: true, cancelable: true, dataTransfer: dt }));
+        dropTarget.dispatchEvent(new DragEvent('drop',      { bubbles: true, cancelable: true, dataTransfer: dt }));
+        if (strategy === 'none') strategy = 'drop';
+      } catch (_) {}
+    }
+
+    // Strategy 3 (paste fallback): paste event with files on the contenteditable.
+    if (strategy === 'none' || /failed/.test(strategy)) {
+      try {
+        const dt = new DataTransfer();
+        for (const f of files) dt.items.add(f);
+        editor.dispatchEvent(new ClipboardEvent('paste', {
+          clipboardData: dt, bubbles: true, cancelable: true
+        }));
+        strategy = 'paste';
+      } catch (_) {}
+    }
+
+    // Wait for ChatGPT to actually finish uploading the attachments BEFORE we
+    // click send. The old check ("send button becomes enabled") was unreliable
+    // because the send button starts enabled (prompt text is already in the
+    // box) — it would return immediately and we'd submit before the upload
+    // pipeline registered any images, producing the dreaded
+    //   "正在分析 [empty] 幅图片"
+    // hang on the OpenAI side.
+    //
+    // Real signal: thumbnail tiles appear in the composer form. We wait for
+    // N tiles (one per file) AND for any "uploading" spinner inside them
+    // to disappear.
+    const expectedCount = files.length;
+    const composer =
+      editor.closest('form') ||
+      editor.closest('[class*="composer"]') ||
+      editor.parentElement;
+
+    function countAttachmentTiles() {
+      if (!composer) return 0;
+      // ChatGPT renders each upload as a tile that contains either an <img>
+      // preview (image files) or a file icon. Count the most reliable union:
+      //   - <img> with blob: / data: src (= locally previewed)
+      //   - elements with data-testid containing "attachment" or "file"
+      const imgs = composer.querySelectorAll('img');
+      let blobImgs = 0;
+      for (const img of imgs) {
+        const src = img.getAttribute('src') || img.currentSrc || '';
+        if (src.startsWith('blob:') || src.startsWith('data:')) blobImgs++;
+      }
+      const tagged = composer.querySelectorAll(
+        '[data-testid*="attachment" i], [data-testid*="file" i]'
+      ).length;
+      return Math.max(blobImgs, tagged);
+    }
+
+    function anyTileStillUploading() {
+      if (!composer) return false;
+      // ChatGPT shows a spinner or "uploading" aria-label while the file is
+      // being POSTed to OpenAI's CDN. Heuristic: any spinner / progressbar in
+      // the composer means we're not ready.
+      return !!composer.querySelector(
+        '[role="progressbar"], [aria-label*="upload" i][aria-busy="true"], ' +
+        '[class*="spinner" i], svg[class*="spin" i]'
+      );
+    }
+
+    // Stage 1: tiles appear.
+    const tilesAppeared = await waitUntil(
+      () => countAttachmentTiles() >= expectedCount ? true : null,
+      { timeoutMs: 30000, intervalMs: 300 }
+    ).catch(() => null);
+
+    if (!tilesAppeared) {
+      const seen = countAttachmentTiles();
+      // HARD fail: submitting now would result in ChatGPT showing
+      // "正在分析  幅图片" forever (empty image count). Throw so the SW's
+      // retry loop reopens the tab and tries again with a fresh composer.
+      throw new Error(`attach failed: only ${seen}/${expectedCount} tiles appeared after 30s (strategy=${strategy})`);
+    } else {
+      // Stage 2: spinners clear.
+      await waitUntil(
+        () => !anyTileStillUploading() ? true : null,
+        { timeoutMs: 90000, intervalMs: 500 }
+      ).catch(() => null);
+      // Small settle delay so React commits the final attachment list before
+      // we click send.
+      await sleep(400);
+      strategy += `:tiles=${countAttachmentTiles()}/${expectedCount}`;
+    }
+
+    return { count: files.length, strategy };
+  }
+
+  async function submitWithAttachments(prompt, images) {
+    if (config.id !== 'chatgpt') {
+      throw new Error(`attachments not supported for provider ${config.id}`);
+    }
+    let attachInfo = null;
+    if (Array.isArray(images) && images.length > 0) {
+      attachInfo = await attachImages(images);
+      // intentionally non-fatal — proceed to submit even if image upload is
+      // ambiguous, so we always at least get the prompt through.
+    }
+    await submitPrompt(prompt, /*skipInput=*/false);
+    return attachInfo;
+  }
+
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.type === 'SUBMIT_AND_WAIT_START') {
       submitAndWaitStart(msg.prompt, msg.skipInput)
         .then(() => sendResponse({ ok: true }))
+        .catch(err => sendResponse({ ok: false, error: err.message ?? String(err) }));
+      return true;
+    }
+    if (msg.type === 'SUBMIT_WITH_ATTACHMENTS') {
+      submitWithAttachments(msg.prompt, msg.images ?? [])
+        .then(info => sendResponse({ ok: true, attach: info }))
         .catch(err => sendResponse({ ok: false, error: err.message ?? String(err) }));
       return true;
     }

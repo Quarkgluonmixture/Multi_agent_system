@@ -1,0 +1,39 @@
+{
+  "manifest_version": 3,
+  "name": "AI Sidebar (GPT / Gemini)",
+  "version": "0.1.0",
+  "description": "Clean side panel for ChatGPT and Gemini, switchable with one click.",
+  "permissions": ["sidePanel", "storage", "declarativeNetRequest"],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*",
+    "https://gemini.google.com/*"
+  ],
+  "declarative_net_request": {
+    "rule_resources": [{
+      "id": "sidebar_iframe_rules",
+      "enabled": true,
+      "path": "iframe_rules.json"
+    }]
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "action": {
+    "default_title": "AI Sidebar"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://gemini.google.com/*"],
+      "exclude_matches": ["https://gemini.google.com/_/*"],
+      "js": ["gemini-cloak.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    }
+  ]
+}

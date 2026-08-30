@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>AI Sidebar</title>
+<style>
+  :root {
+    --bg: #0e0f12;
+    --bg-soft: #16181d;
+    --fg: #e6e8ec;
+    --fg-dim: #8b9098;
+    --border: #232730;
+    --accent-gpt: #10a37f;
+    --accent-gemini: #4d8bff;
+    --shadow: 0 1px 0 rgba(255,255,255,0.04) inset;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #ffffff;
+      --bg-soft: #f5f6f8;
+      --fg: #1a1d21;
+      --fg-dim: #6b7077;
+      --border: #e3e5ea;
+      --shadow: 0 1px 0 rgba(0,0,0,0.02) inset;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    width: 100%;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+    overflow: hidden;
+  }
+  body {
+    display: flex;
+    flex-direction: column;
+  }
+  .tabs {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 8px;
+    background: var(--bg-soft);
+    border-bottom: 1px solid var(--border);
+    box-shadow: var(--shadow);
+  }
+  .tab {
+    flex: 1 1 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    cursor: pointer;
+    user-select: none;
+    color: var(--fg-dim);
+    background: transparent;
+    border: 1px solid transparent;
+    font-size: 13px;
+    font-weight: 500;
+    transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+  }
+  .tab:hover {
+    background: rgba(127,127,127,0.08);
+    color: var(--fg);
+  }
+  .tab.active {
+    background: var(--bg);
+    color: var(--fg);
+    border-color: var(--border);
+  }
+  .tab.active[data-provider="gpt"] {
+    box-shadow: 0 0 0 1px var(--accent-gpt) inset;
+  }
+  .tab.active[data-provider="gemini"] {
+    box-shadow: 0 0 0 1px var(--accent-gemini) inset;
+  }
+  .tab img {
+    width: 18px;
+    height: 18px;
+    border-radius: 4px;
+    object-fit: cover;
+  }
+  .reload-btn {
+    flex: 0 0 auto;
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 8px;
+    background: transparent;
+    border: 1px solid transparent;
+    color: var(--fg-dim);
+    cursor: pointer;
+    font-size: 16px;
+    line-height: 1;
+    transition: background 0.15s ease, color 0.15s ease;
+  }
+  .reload-btn:hover {
+    background: rgba(127,127,127,0.08);
+    color: var(--fg);
+  }
+  .frames {
+    flex: 1 1 auto;
+    position: relative;
+    background: var(--bg);
+    overflow: hidden;
+  }
+  .frames iframe {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    border: 0;
+    background: var(--bg);
+    visibility: hidden;
+  }
+  .frames iframe.active {
+    visibility: visible;
+  }
+</style>
+</head>
+<body>
+  <div class="tabs">
+    <button class="tab" data-provider="gpt" id="tab-gpt">
+      <img src="icons/chatgpt.jpeg" alt="">
+      <span>ChatGPT</span>
+    </button>
+    <button class="tab" data-provider="gemini" id="tab-gemini">
+      <img src="icons/gemini.jpeg" alt="">
+      <span>Gemini</span>
+    </button>
+    <button class="reload-btn" id="reload-btn" title="刷新当前">⟳</button>
+  </div>
+  <div class="frames">
+    <iframe id="frame-gpt" data-provider="gpt" data-src="https://chatgpt.com/" allow="clipboard-read; clipboard-write; microphone; camera"></iframe>
+    <iframe id="frame-gemini" data-provider="gemini" data-src="https://gemini.google.com/app" allow="clipboard-read; clipboard-write; microphone; camera"></iframe>
+  </div>
+<script src="sidepanel.js"></script>
+</body>
+</html>

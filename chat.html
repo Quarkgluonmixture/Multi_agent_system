@@ -738,124 +738,153 @@
       display: block;
     }
 
-    /* ===== Pipeline Animator ===== */
+    /* ===== Pipeline Animator (v0.69 enhanced — Gemini-designed) ===== */
     #pipeline-animator {
       position: relative;
-      width: 100%;
-      max-width: 600px;
-      height: 280px;
-      margin: 10px auto;
-      background: var(--panel-bg);
-      border: 1px solid var(--border);
-      border-radius: var(--radius-md);
-      overflow: hidden;
-      display: none;
-      opacity: 0;
-      transition: opacity 0.4s ease;
-      box-shadow: inset 0 2px 4px rgba(0,0,0,0.02);
-      user-select: none;
+      width: 100%; max-width: 600px; height: 280px; margin: 10px auto;
+      background: var(--panel-bg); border: 1px solid var(--border);
+      border-radius: var(--radius-md); overflow: hidden;
+      display: none; opacity: 0; transition: opacity 0.4s ease;
+      box-shadow: inset 0 2px 4px rgba(0,0,0,0.02); user-select: none;
       flex-shrink: 0;
     }
     #pipeline-animator.active { display: block; opacity: 1; }
     .pa-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
     #pa-lines-layer { z-index: 1; }
-    #pa-scroll-layer { z-index: 2; pointer-events: none; }
-    #pa-avatars-layer { z-index: 3; }
+    #pa-hub-layer { z-index: 2; pointer-events: none; }
+    #pa-scroll-layer { z-index: 3; pointer-events: none; }
+    #pa-avatars-layer { z-index: 4; }
+
+    .stage-r1 .pa-avatar-wrapper { left: var(--x-r1); top: var(--y-r1); }
+    .stage-r2 .pa-avatar-wrapper { left: var(--x-r2); top: var(--y-r2); }
+
     .pa-avatar-wrapper {
-      position: absolute;
-      transform: translate(-50%, -50%);
+      position: absolute; transform: translate(-50%, -50%);
       display: flex; flex-direction: column; align-items: center;
-      transition: all 0.8s cubic-bezier(0.34, 1.56, 0.64, 1);
+      transition: all 0.7s cubic-bezier(0.34, 1.56, 0.64, 1);
     }
     .pa-avatar-core {
-      width: 44px; height: 44px;
-      border-radius: var(--radius-full);
-      background: var(--panel-bg);
-      border: 2px solid var(--base-color);
-      color: var(--base-color);
-      display: flex; align-items: center; justify-content: center;
-      font-size: 14px; font-weight: 700;
-      position: relative;
-      box-shadow: var(--shadow-md);
-      transition: all 0.3s;
+      width: 44px; height: 44px; border-radius: var(--radius-full);
+      background: var(--panel-bg); border: 2px solid var(--base-color);
+      color: var(--base-color); display: flex; align-items: center; justify-content: center;
+      font-size: 14px; font-weight: 700; position: relative;
+      box-shadow: var(--shadow-md); transition: all 0.3s;
       overflow: hidden;
     }
     .pa-avatar-img {
-      width: 100%; height: 100%;
-      object-fit: contain;
-      padding: 4px;
-      background: #fff;
+      width: 100%; height: 100%; object-fit: contain;
+      padding: 4px; background: #fff;
     }
+    /* R1: ripple wave */
     .pa-avatar-ring {
-      position: absolute; inset: -5px;
-      border-radius: var(--radius-full);
-      border: 2px dashed var(--base-color);
-      opacity: 0;
-      transition: opacity 0.3s;
+      position: absolute; inset: 0; border-radius: var(--radius-full);
+      background: var(--base-color); opacity: 0; pointer-events: none;
     }
+    /* R1: typing dots underneath */
+    .pa-typing-dots {
+      position: absolute; bottom: -18px; display: flex; gap: 3px;
+      opacity: 0; transition: opacity 0.3s;
+    }
+    .pa-typing-dots span {
+      width: 4px; height: 4px; background: var(--base-color); border-radius: 50%;
+      animation: pa-dot-bounce 1.2s infinite ease-in-out both;
+    }
+    .pa-typing-dots span:nth-child(1) { animation-delay: -0.32s; }
+    .pa-typing-dots span:nth-child(2) { animation-delay: -0.16s; }
+
     .pa-role {
-      position: absolute; bottom: -12px;
-      font-size: 10px; font-weight: 600;
-      padding: 2px 6px;
-      border-radius: 4px;
+      position: absolute; bottom: -12px; font-size: 11px; font-weight: 700;
+      padding: 2px 8px; border-radius: 4px;
       background: var(--base-color); color: #fff;
-      opacity: 0;
-      transform: translateY(-5px);
-      transition: all 0.4s;
-      white-space: nowrap;
-      box-shadow: var(--shadow-md);
+      opacity: 0; transform: translateY(-5px); transition: all 0.4s;
+      white-space: nowrap; box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+      letter-spacing: 0.05em; text-shadow: 0 1px 1px rgba(0,0,0,0.2);
     }
     .pa-status-icon {
       position: absolute; top: -4px; right: -4px;
-      width: 16px; height: 16px;
-      background: var(--base-color);
-      border-radius: 50%;
-      border: 2px solid var(--panel-bg);
+      width: 16px; height: 16px; background: var(--base-color);
+      border-radius: 50%; border: 2px solid var(--panel-bg);
       display: flex; align-items: center; justify-content: center;
       opacity: 0; transform: scale(0);
-      transition: all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+      transition: all 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
     }
     .pa-status-icon svg { width: 10px; height: 10px; stroke: #fff; stroke-width: 3; fill: none; }
-    .stage-r1 .pa-avatar-wrapper { left: var(--x-r1); top: var(--y-r1); }
-    .stage-r2 .pa-avatar-wrapper { left: var(--x-r2); top: var(--y-r2); }
+
+    /* === Stage R1: 各自陈述 === */
     .stage-r1 .pa-avatar-wrapper[data-status="running"] .pa-avatar-ring {
-      opacity: 0.6;
-      animation: pa-spin 3s linear infinite;
+      animation: pa-ripple 1.5s cubic-bezier(0.21, 0.53, 0.56, 1) infinite;
+    }
+    .stage-r1 .pa-avatar-wrapper[data-status="running"] .pa-typing-dots { opacity: 1; }
+    /* Done: instant brand-color shockwave (0.7s, one-shot via the ring),
+       then the avatar core settles into a slow pulsing glow. The shockwave
+       guarantees a visible "完成" moment even if the stage flips quickly
+       afterwards. */
+    .stage-r1 .pa-avatar-wrapper[data-status="done"] .pa-avatar-ring {
+      animation: pa-done-burst 0.8s cubic-bezier(0.2, 0.6, 0.3, 1) forwards;
     }
     .stage-r1 .pa-avatar-wrapper[data-status="done"] .pa-avatar-core {
-      box-shadow: 0 0 12px var(--base-color);
+      animation: pa-done-pulse 2.4s ease-in-out infinite;
     }
     .stage-r1 .pa-avatar-wrapper[data-status="done"] .pa-status-icon {
       opacity: 1; transform: scale(1);
     }
-    .stage-r2 .pa-role { opacity: 1; transform: translateY(12px); }
-    .stage-r2 .pa-avatar-wrapper[data-status="running"] .pa-avatar-core {
-      animation: pa-wiggle 0.4s ease-in-out infinite alternate;
+
+    /* === Stage R2: 群儒论战 === */
+    #pa-clash-hub {
+      position: absolute; left: 50%; top: 50%; width: 40px; height: 40px;
+      transform: translate(-50%, -50%) scale(0); border-radius: 50%;
+      background: radial-gradient(circle, var(--text-muted) 10%, transparent 70%);
+      opacity: 0; transition: all 0.5s;
     }
-    .stage-r2 .pa-avatar-wrapper[data-status="done"] {
-      animation: pa-nod 0.6s ease forwards;
+    .stage-r2 #pa-clash-hub {
+      transform: translate(-50%, -50%) scale(1); opacity: 0.3;
+      animation: pa-hub-pulse 0.8s infinite alternate;
+    }
+    .stage-r2 .pa-role { opacity: 1; transform: translateY(14px); }
+    .stage-r2 .pa-avatar-wrapper[data-status="running"] .pa-avatar-core {
+      animation: pa-argue-shake 0.35s infinite;
+      box-shadow: 0 4px 15px var(--base-color);
+    }
+    .stage-r2 .pa-avatar-wrapper[data-status="running"] .pa-role {
+      animation: pa-role-flash 0.6s infinite alternate;
+    }
+    .stage-r2 .pa-avatar-wrapper[data-status="done"] .pa-avatar-core {
+      transform: scale(0.9); border-color: var(--text-muted); color: var(--text-muted);
+      box-shadow: none; background: var(--round-bg, #f9fafb);
+    }
+    .stage-r2 .pa-avatar-wrapper[data-status="done"] .pa-role {
+      background: var(--text-muted); box-shadow: none;
     }
     .stage-r2 .pa-avatar-wrapper[data-status="done"] .pa-status-icon {
-      opacity: 1; transform: scale(1);
+      background: var(--text-muted); opacity: 1; transform: scale(1);
     }
+    /* R2 done: one-shot burst — final brand-color shockwave before retreating
+       into gray. Two synchronized layers: a large color ring expands outward,
+       and the avatar core itself flashes a hard outer glow that decays. */
+    .stage-r2 .pa-avatar-wrapper[data-status="done"] .pa-avatar-ring {
+      animation: pa-done-burst 0.9s cubic-bezier(0.2, 0.6, 0.3, 1) forwards;
+    }
+    .stage-r2 .pa-avatar-wrapper[data-status="done"] .pa-avatar-core {
+      animation: pa-done-flash 0.9s ease-out;
+    }
+
+    /* R2: bullet-stream lines */
     .pa-line {
-      stroke: var(--text-muted);
-      stroke-width: 1.5;
-      stroke-dasharray: 6 6;
-      opacity: 0;
-      transition: opacity 0.5s;
+      stroke: var(--text-muted); stroke-width: 1.5;
+      stroke-dasharray: 4 12; stroke-linecap: round;
+      opacity: 0; transition: opacity 0.5s;
     }
     .stage-r2 .pa-line {
-      opacity: 0.35;
-      animation: pa-flow 15s linear infinite;
+      opacity: 0.5;
+      animation: pa-data-fire 0.4s linear infinite;
     }
+
+    /* === Stage Final: 主编呈奏 === */
     .stage-final .pa-line { opacity: 0; }
+    .stage-final #pa-clash-hub { opacity: 0; }
     .stage-final .pa-avatar-wrapper:not(.is-final) {
-      opacity: 0.15;
-      transform: translate(-50%, -50%) scale(0.6);
+      opacity: 0.15; transform: translate(-50%, -50%) scale(0.6);
       filter: grayscale(100%);
-    }
-    .stage-final .pa-avatar-wrapper:not(.is-final) {
       left: var(--x-r1); top: var(--y-r1);
     }
     .stage-final .pa-avatar-wrapper.is-final {
@@ -864,45 +893,82 @@
     }
     .stage-final .pa-avatar-wrapper.is-final .pa-avatar-core {
       box-shadow: 0 0 20px var(--base-color);
+      border-color: var(--base-color); color: var(--base-color);
+      background: var(--panel-bg);
     }
     .stage-final .pa-avatar-wrapper.is-final .pa-role { opacity: 0; }
+    .stage-final .pa-avatar-wrapper.is-final .pa-status-icon { opacity: 0; }
+
     #pa-scroll-box {
-      position: absolute;
-      left: 50%; top: 55%;
+      position: absolute; left: 50%; top: 55%;
       width: 220px; height: 0;
       transform: translate(-50%, -50%);
-      background: var(--panel-bg);
-      border: 1px solid var(--border);
-      border-radius: var(--radius-sm);
-      box-shadow: var(--shadow-float);
+      background: var(--panel-bg); border: 1px solid var(--border);
+      border-radius: var(--radius-sm); box-shadow: var(--shadow-float);
       opacity: 0;
-      transition: all 0.6s cubic-bezier(0.4, 0, 0.2, 1);
-      transition-delay: 0.3s;
-      overflow: hidden;
-      display: flex; flex-direction: column;
-      padding: 0 16px;
-      justify-content: center;
-      gap: 10px;
+      transition: all 0.6s cubic-bezier(0.4, 0, 0.2, 1); transition-delay: 0.3s;
+      overflow: hidden; display: flex; flex-direction: column;
+      padding: 0 16px; justify-content: center; gap: 10px;
     }
     .stage-final #pa-scroll-box { height: 100px; opacity: 1; }
     .pa-skeleton {
-      height: 8px;
-      border-radius: 4px;
+      height: 8px; border-radius: 4px;
       background: linear-gradient(90deg, var(--border-soft) 25%, var(--border) 50%, var(--border-soft) 75%);
       background-size: 200% 100%;
       animation: pa-shimmer 1.5s infinite linear;
     }
-    @keyframes pa-spin { 100% { transform: rotate(360deg); } }
-    @keyframes pa-flow { to { stroke-dashoffset: -400; } }
-    @keyframes pa-shimmer { to { background-position: -200% 0; } }
-    @keyframes pa-wiggle {
-      0%   { transform: rotate(-4deg) translateY(-1px); }
-      100% { transform: rotate(4deg) translateY(1px); }
+
+    /* === Keyframes === */
+    @keyframes pa-ripple {
+      0%   { transform: scale(0.8); opacity: 0.6; }
+      100% { transform: scale(1.7); opacity: 0; }
     }
-    @keyframes pa-nod {
-      0%   { transform: translate(-50%, -50%); }
-      50%  { transform: translate(-50%, -40%); }
-      100% { transform: translate(-50%, -50%); }
+    @keyframes pa-dot-bounce {
+      0%, 80%, 100% { transform: scale(0); }
+      40% { transform: scale(1); }
+    }
+    @keyframes pa-data-fire { to { stroke-dashoffset: -16; } }
+    @keyframes pa-hub-pulse {
+      from { transform: translate(-50%, -50%) scale(0.8); opacity: 0.2; }
+      to   { transform: translate(-50%, -50%) scale(1.2); opacity: 0.5; }
+    }
+    @keyframes pa-shimmer { to { background-position: -200% 0; } }
+    @keyframes pa-argue-shake {
+      0%   { transform: scale(1.1) translate(0, 0); }
+      25%  { transform: scale(1.1) translate(-1px, 1px); }
+      50%  { transform: scale(1.1) translate(1px, -1px); }
+      75%  { transform: scale(1.1) translate(-1px, -1px); }
+      100% { transform: scale(1.1) translate(1px, 1px); }
+    }
+    @keyframes pa-role-flash {
+      from { box-shadow: 0 0 2px var(--base-color); }
+      to   { box-shadow: 0 0 10px var(--base-color); }
+    }
+    /* R2 done: single dramatic burst — bigger scale, brighter, slightly
+       longer than v0.71. Pairs with pa-done-flash on the avatar core. */
+    @keyframes pa-done-burst {
+      0%   { opacity: 0.75; transform: scale(0.7); }
+      40%  { opacity: 0.55; transform: scale(1.4); }
+      100% { opacity: 0;    transform: scale(2.6); }
+    }
+    @keyframes pa-done-flash {
+      0%   { box-shadow: 0 0 0 6px var(--base-color), 0 0 40px 8px var(--base-color); }
+      60%  { box-shadow: 0 0 0 3px var(--base-color), 0 0 20px 4px var(--base-color); }
+      100% { box-shadow: 0 0 0 0 transparent, 0 0 0 0 transparent; }
+    }
+    /* Done state for R1: extended outer ring + breathing glow.
+       4-6px solid ring (visible halo around the logo) + outer aura. */
+    @keyframes pa-done-pulse {
+      0%, 100% {
+        box-shadow:
+          0 0 0 4px var(--base-color),
+          0 0 18px 2px var(--base-color);
+      }
+      50% {
+        box-shadow:
+          0 0 0 6px var(--base-color),
+          0 0 32px 4px var(--base-color);
+      }
     }
 
     /* ===== Scrollbars ===== */
@@ -930,10 +996,11 @@
 </head>
 <body>
   <div class="header">
-    <h1>Multi AI Chat · v0.65</h1>
+    <h1>Multi AI Chat · v0.79</h1>
     <div class="actions">
       <button id="fullscreen-btn" title="进入全屏（再点退出）">全屏</button>
       <button id="toggle-grid-btn" title="显示 / 隐藏底部的 4 个 AI iframe（debug 用）">看 Grid</button>
+      <button id="clean-gemini-btn" title="打开 Gemini 历史并批量删除（iframe 模式没临时对话，手动清）">清 Gemini</button>
       <button id="theme-btn" title="切换主题">深色</button>
       <button id="clear-btn" title="清空对话">新对话</button>
       <button id="copy-debug" title="复制 debug 信息">Debug</button>

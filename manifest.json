@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
-  "name": "Multi AI Chat (v0.65)",
-  "version": "0.0.65",
+  "name": "Multi AI Chat (v0.79)",
+  "version": "0.0.79",
   "description": "Multi-turn chat that runs every message through a 3-round multi-AI deliberation.",
-  "permissions": ["tabs", "sidePanel", "scripting", "storage", "declarativeNetRequest"],
+  "permissions": ["tabs", "sidePanel", "scripting", "storage", "declarativeNetRequest", "alarms"],
   "declarative_net_request": {
     "rule_resources": [{
       "id": "ai_iframe_rules",
@@ -17,7 +17,9 @@
     "https://gemini.google.com/*",
     "https://chat.deepseek.com/*",
     "https://www.kimi.com/*",
-    "https://kimi.com/*"
+    "https://kimi.com/*",
+    "https://web.whatsapp.com/*",
+    "https://api.telegram.org/*"
   ],
   "background": {
     "service_worker": "background.js",
@@ -42,6 +44,20 @@
       "js": ["content_adapter.js"],
       "run_at": "document_idle",
       "all_frames": true
+    },
+    {
+      "matches": ["https://gemini.google.com/*"],
+      "exclude_matches": ["https://gemini.google.com/_/*"],
+      "js": ["gemini-cloak.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    },
+    {
+      "matches": ["https://web.whatsapp.com/*"],
+      "js": ["whatsapp_inject.js"],
+      "run_at": "document_idle",
+      "all_frames": false
     }
   ]
 }

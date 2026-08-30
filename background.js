@@ -1,3 +1,5 @@
+import { TelegramRelay } from './telegram_relay.js';
+
 // Action icon click → open chat.html in its own dedicated browser window.
 // Why a separate window: when chat.html shares a window with other tabs,
 // switching to another tab in that window puts chat.html (and its 4
@@ -40,6 +42,140 @@ async function openOrFocusChatWindow() {
 chrome.action.onClicked.addListener(async () => {
   try { await openOrFocusChatWindow(); } catch (_) {}
 });
+
+// Bulk-delete Gemini conversation history. Opens gemini.google.com in a
+// top-frame tab (so the chat list UI loads with all controls — temp chat
+// gating doesn't apply to deletion), then walks the side panel clicking
+// each conversation's "更多选项" → "删除" → confirm dialog.
+async function cleanGeminiHistory() {
+  const tab = await chrome.tabs.create({
+    url: 'https://gemini.google.com/app',
+    active: true
+  });
+  // Wait for Gemini to fully render the chat list
+  await new Promise(r => setTimeout(r, 5000));
+
+  const [res] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: async () => {
+      const sleep = ms => new Promise(r => setTimeout(r, ms));
+      const stats = { total: 0, deleted: 0, skipped: 0, error: null };
+
+      // Helper: find visible button matching predicate
+      const findVisible = (selectors, predicate) => {
+        for (const sel of selectors) {
+          const els = document.querySelectorAll(sel);
+          for (const el of els) {
+            if (el.offsetParent === null) continue; // not visible
+            if (!predicate || predicate(el)) return el;
+          }
+        }
+        return null;
+      };
+
+      // Each saved chat has a button with aria-label ending in "的更多选项"
+      const moreSelector = 'button[aria-label$="的更多选项"], button[aria-label$="More options"]';
+
+      stats.total = document.querySelectorAll(moreSelector).length;
+      if (stats.total === 0) {
+        stats.error = '没找到对话列表 — Gemini 页面可能没加载完，或没有历史可删';
+        return stats;
+      }
+
+      let consecutiveStuck = 0;
+      let prevCount = stats.total;
+
+      while (consecutiveStuck < 3) {
+        const btns = document.querySelectorAll(moreSelector);
+        if (btns.length === 0) break;
+
+        // Detect stuck (delete didn't reduce count)
+        if (btns.length >= prevCount) {
+          consecutiveStuck++;
+        } else {
+          consecutiveStuck = 0;
+        }
+        prevCount = btns.length;
+
+        // Open ⋮ menu for first chat
+        const firstMore = btns[0];
+        firstMore.click();
+        await sleep(450);
+
+        // Find "删除" / "Delete" menu item
+        let deleteItem = null;
+        const candidates = document.querySelectorAll('[role="menuitem"], button, [role="option"]');
+        for (const c of candidates) {
+          if (c.offsetParent === null) continue;
+          const txt = (c.textContent || '').trim();
+          const lbl = c.getAttribute('aria-label') || '';
+          if (/^删除$|^删除聊天/.test(txt) || /^Delete( chat)?$/i.test(txt) ||
+              /删除/.test(lbl) || /Delete/i.test(lbl)) {
+            // Skip if it's a "delete account" or unrelated. Heuristic: must be in popped menu near our click.
+            deleteItem = c;
+            break;
+          }
+        }
+
+        if (!deleteItem) {
+          // Close the menu via Escape and skip
+          document.dispatchEvent(new KeyboardEvent('keydown', {
+            key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true
+          }));
+          await sleep(200);
+          stats.skipped++;
+          continue;
+        }
+
+        deleteItem.click();
+        await sleep(500);
+
+        // Confirmation dialog: find a visible 删除/Delete button (different from menu's)
+        let confirmBtn = null;
+        const dialogBtns = document.querySelectorAll('div[role="dialog"] button, mat-dialog-container button');
+        for (const b of dialogBtns) {
+          if (b.offsetParent === null) continue;
+          const txt = (b.textContent || '').trim();
+          if (/^删除$/.test(txt) || /^Delete$/i.test(txt)) {
+            confirmBtn = b;
+            break;
+          }
+        }
+        // Fallback: any visible button with text "删除" / "Delete" (no other text)
+        if (!confirmBtn) {
+          const allBtns = document.querySelectorAll('button');
+          for (const b of allBtns) {
+            if (b.offsetParent === null) continue;
+            const txt = (b.textContent || '').trim();
+            if (txt === '删除' || /^Delete$/i.test(txt)) {
+              confirmBtn = b;
+              break;
+            }
+          }
+        }
+
+        if (confirmBtn) {
+          confirmBtn.click();
+          await sleep(900); // wait for chat to be removed from list
+          stats.deleted++;
+        } else {
+          // No confirm button found — close any open dialog
+          document.dispatchEvent(new KeyboardEvent('keydown', {
+            key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true
+          }));
+          await sleep(200);
+          stats.skipped++;
+        }
+      }
+
+      if (consecutiveStuck >= 3) {
+        stats.error = '连续 3 次没能删除（选择器可能变了，或剩下的是 pinned 不可删）';
+      }
+      return stats;
+    }
+  });
+  return res?.result ?? { error: 'no result from script' };
+}
 
 const PROVIDERS = {
   chatgpt: {
@@ -202,12 +338,13 @@ async function reloadProviderFrame(gridTabId, provider) {
   );
 
   // Wait until the iframe's input is actually present + autoInit has settled.
-  // Probe the iframe state via PROBE_STATE; consider it "ready" when input is
-  // found AND the page settled (visibility=visible, no in-flight banners).
-  // Fall back to a short sleep if probing keeps failing.
+  // Probe at 200ms intervals (was 500ms) for faster detection — input usually
+  // appears in 1-2 ticks. Total budget 8s. Failure fallback shortened from
+  // 1.5s → 800ms; if probing fully failed the input probably won't appear
+  // soon anyway.
   const newFrameId = providerFrames.get(gridTabId)?.[provider];
   let ready = false;
-  for (let i = 0; i < 24 && !ready; i++) { // up to 12s
+  for (let i = 0; i < 40 && !ready; i++) { // up to 8s at 200ms
     try {
       const r = await chrome.tabs.sendMessage(
         gridTabId,
@@ -219,9 +356,9 @@ async function reloadProviderFrame(gridTabId, provider) {
         break;
       }
     } catch (_) {}
-    await swSleep(500);
+    await swSleep(200);
   }
-  if (!ready) await swSleep(1500);
+  if (!ready) await swSleep(800);
 }
 
 // Kimi-specific: direct Lexical injection. Kimi's input is a Lexical
@@ -1254,28 +1391,24 @@ async function runStage({ providers, prompts, stage, signal }) {
     schedulePersistDebug();
   };
 
-  // Per-provider submit + poll. Throws on any failure (caller decides retry).
-  // Captures the iframe's frameId at call time so retries (which reload the
-  // iframe and produce a new frameId) work correctly.
-  async function submitAndPoll(provider, prompt) {
+  // Per-provider submit + poll. Hijack already happened in the parallel
+  // pre-pass; we just need to fire SUBMIT_AND_WAIT_START (which clicks
+  // the send button) and wait for output. skipInput tells content_adapter
+  // to verify the prompt is in the editor and click send (no setInputValue).
+  async function submitAndPollOnce(provider, prompt, skipInput) {
     const frameId = getFrameId(gridTabId, provider);
     if (frameId == null) throw new Error(`No frameId for ${provider}`);
 
     postProvider(provider, stage, { status: 'running', stage: 'submitting' });
 
-    let skipInput = false;
-    if (provider === 'gemini') {
-      const r = await injectGeminiPromptViaQuill(gridTabId, frameId, prompt);
-      recordHijack(provider, r);
-      if (r?.ok) skipInput = true;
-    } else if (provider === 'chatgpt') {
-      const r = await injectChatGPTPromptViaEditor(gridTabId, frameId, prompt);
-      recordHijack(provider, r);
-      if (r?.ok) skipInput = true;
-    } else if (provider === 'kimi') {
-      const r = await injectKimiPromptViaLexical(gridTabId, frameId, prompt);
-      recordHijack(provider, r);
-      if (r?.ok) skipInput = true;
+    // Gemini-specific: wait ~1s between Quill setText and clicking send.
+    // Without this, Gemini's React onClick handler runs before its state
+    // machine has fully consumed the source='user' text-change event, and
+    // the click is silently rejected. R1/R2 worked because the serial
+    // stagger naturally gave Gemini ~1.2s of wait (Gemini sorted last);
+    // Final has only Gemini so no stagger, hence the explicit delay here.
+    if (provider === 'gemini' && skipInput) {
+      await swSleep(1000);
     }
 
     if (!skipInput && provider !== 'deepseek') {
@@ -1312,53 +1445,94 @@ async function runStage({ providers, prompts, stage, signal }) {
     return text;
   }
 
-  // ----- Phase 2 + 3: parallel submit + poll, with one retry on transient failure -----
-  return await Promise.all(providers.map(async (provider) => {
-    if (failed.has(provider)) {
-      return { provider, ok: false, error: 'failed in earlier phase' };
-    }
-    if (signal?.aborted) {
-      return { provider, ok: false, error: 'Pipeline cancelled' };
-    }
+  // ----- Phase 2: SERIAL submit, then Phase 3: parallel poll -----
+  // We tried parallel Phase 2 earlier — it broke Gemini's R1/R2 send-button
+  // click. Final never had this issue because Final has only 1 provider.
+  // The 4-way parallel submit must trigger some event-queue contention in
+  // Gemini's React onClick handler (isTrusted=false detection that's only
+  // strict under concurrent activity). Going serial costs ~2-3s on Phase 2
+  // but makes Gemini submit auto-fire reliably.
+  const submitOrder = [...providers];
+  // Submit Gemini LAST so any contention from other providers is settled
+  // before its click. Empirically Gemini is the most fragile.
+  submitOrder.sort((a, b) => (a === 'gemini' ? 1 : 0) - (b === 'gemini' ? 1 : 0));
 
-    let text = null;
-    let lastErr = null;
-    const MAX_ATTEMPTS = 2;
-
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      try {
-        if (attempt > 1) {
-          // Reload iframe for a fresh slate before retrying. Phase 1's reload
-          // already happened for attempt 1; we redo it here for attempt 2.
-          postProvider(provider, stage, { status: 'running', stage: `retry ${attempt - 1}` });
-          await reloadProviderFrame(gridTabId, provider);
-          if (signal?.aborted) throw new Error('Pipeline cancelled');
-        }
-        text = await submitAndPoll(provider, prompts[provider]);
-        break; // success
-      } catch (err) {
-        lastErr = err;
-        const msg = err?.message ?? String(err);
-        const isTransient =
-          /No assistant text appeared|Empty output|submit failed|message channel closed|Receiving end does not exist|Generation did not complete|Probe failed|swWaitUntil timeout/i.test(msg);
-        const isCancelled = signal?.aborted || /Pipeline cancelled/.test(msg);
-        if (isCancelled) break;
-        if (!isTransient) break;
-        if (attempt === MAX_ATTEMPTS) break;
-        // else loop continues to retry
-      }
-    }
-
-    if (text != null) {
-      const elapsedMs = Date.now() - (startTimes[provider] ?? startedAt);
-      postProvider(provider, stage, { status: 'done', output: text, elapsedMs });
-      return { provider, ok: true, output: text, elapsedMs };
-    }
-    const error = lastErr?.message ?? String(lastErr);
-    postProvider(provider, stage, { status: 'failed', error });
-    return { provider, ok: false, error };
+  // Run hijacks (no UI interaction) in parallel — fast and safe. Records
+  // skipInput per provider so Phase 2's submit-click can run in serial.
+  const skipInputMap = {};
+  await Promise.all(providers.map(async (provider) => {
+    if (failed.has(provider) || signal?.aborted) return;
+    try {
+      const frameId = getFrameId(gridTabId, provider);
+      if (frameId == null) return;
+      let r = null;
+      if (provider === 'gemini') r = await injectGeminiPromptViaQuill(gridTabId, frameId, prompts[provider]);
+      else if (provider === 'chatgpt') r = await injectChatGPTPromptViaEditor(gridTabId, frameId, prompts[provider]);
+      else if (provider === 'kimi') r = await injectKimiPromptViaLexical(gridTabId, frameId, prompts[provider]);
+      if (r) recordHijack(provider, r);
+      if (r?.ok) skipInputMap[provider] = true;
+    } catch (_) { /* serial submit will retry / handle */ }
   }));
+
+  // Now serial submit-click (each provider's send button click), then
+  // launch poll in parallel after all submits done.
+  const pollPromises = [];
+  for (const provider of submitOrder) {
+    if (failed.has(provider) || signal?.aborted) {
+      pollPromises.push(Promise.resolve({
+        provider, ok: false, error: failed.has(provider) ? 'failed in earlier phase' : 'Pipeline cancelled'
+      }));
+      continue;
+    }
+    pollPromises.push((async () => {
+      let text = null;
+      let lastErr = null;
+      const MAX_ATTEMPTS = 2;
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        try {
+          if (attempt > 1) {
+            postProvider(provider, stage, { status: 'running', stage: `retry ${attempt - 1}` });
+            await reloadProviderFrame(gridTabId, provider);
+            if (signal?.aborted) throw new Error('Pipeline cancelled');
+            // Re-hijack on retry since iframe reloaded
+            const frameId2 = getFrameId(gridTabId, provider);
+            if (frameId2 != null) {
+              let r2 = null;
+              if (provider === 'gemini') r2 = await injectGeminiPromptViaQuill(gridTabId, frameId2, prompts[provider]);
+              else if (provider === 'chatgpt') r2 = await injectChatGPTPromptViaEditor(gridTabId, frameId2, prompts[provider]);
+              else if (provider === 'kimi') r2 = await injectKimiPromptViaLexical(gridTabId, frameId2, prompts[provider]);
+              if (r2) recordHijack(provider, r2);
+              skipInputMap[provider] = !!r2?.ok;
+            }
+          }
+          text = await submitAndPollOnce(provider, prompts[provider], !!skipInputMap[provider]);
+          break;
+        } catch (err) {
+          lastErr = err;
+          const msg = err?.message ?? String(err);
+          const isTransient =
+            /No assistant text appeared|Empty output|submit failed|message channel closed|Receiving end does not exist|Generation did not complete|Probe failed|swWaitUntil timeout/i.test(msg);
+          const isCancelled = signal?.aborted || /Pipeline cancelled/.test(msg);
+          if (isCancelled || !isTransient || attempt === MAX_ATTEMPTS) break;
+        }
+      }
+      if (text != null) {
+        const elapsedMs = Date.now() - (startTimes[provider] ?? startedAt);
+        postProvider(provider, stage, { status: 'done', output: text, elapsedMs });
+        return { provider, ok: true, output: text, elapsedMs };
+      }
+      const error = lastErr?.message ?? String(lastErr);
+      postProvider(provider, stage, { status: 'failed', error });
+      return { provider, ok: false, error };
+    })());
+    // Small stagger between starting each provider's submit-click to avoid
+    // the parallel-click contention that breaks Gemini.
+    await swSleep(400);
+  }
+
+  return await Promise.all(pollPromises);
 }
+
 
 // =================== Prompt templates ===================
 
@@ -1645,6 +1819,764 @@ async function runFullPipeline(userPrompt, history = [], enabledProviders, final
   };
 }
 
+// =================== iPhone → ChatGPT → WhatsApp relay ===================
+//
+// Long-polls Telegram for photos sent by an allowed user, drops them into a
+// dedicated ChatGPT tab with a fixed prompt, waits for the answer to stabilise,
+// then opens web.whatsapp.com/send and lets whatsapp_inject.js auto-send it.
+//
+// Settings live in chrome.storage.local under the keys defined below; the
+// sidepanel exposes a small UI for filling them in. The relay survives SW
+// restarts via chrome.alarms (the SW is woken once a minute and re-arms the
+// poller if it's not running but the user enabled it).
+
+const RELAY_KEYS = {
+  enabled:          'tgRelay.enabled',
+  token:            'tgRelay.token',
+  allowedUserId:    'tgRelay.allowedUserId',
+  allowedChannelId: 'tgRelay.allowedChannelId',
+  prompt:           'tgRelay.prompt',
+  waPhone:          'tgRelay.waPhone',
+  destTelegram:     'tgRelay.destTelegram',
+  destWhatsapp:     'tgRelay.destWhatsapp',
+  keepTabs:         'tgRelay.keepTabs',
+  // Pipeline state for SW-death recovery and dedup.
+  queue:            'tgRelay.queue',      // [batch] — waiting to be processed
+  inFlight:         'tgRelay.inFlight',   // batch | null — being processed when SW last alive
+  processed:        'tgRelay.processed',  // { batchId: completedAt } — dedup ring
+  lastAnswer:       'tgRelay.lastAnswer', // { text, batchId, chatId, ts, ... }
+};
+
+// How long a queued batch may sit before recovery drops it. Useful so that
+// if you shut down for the night, yesterday's images don't suddenly auto-run
+// at 9am when the SW wakes up.
+const RELAY_QUEUE_MAX_AGE_MS = 30 * 60 * 1000;
+const RELAY_PROCESSED_KEEP = 100;
+const RELAY_MAX_ATTEMPTS = 3;
+
+const RELAY_DEFAULT_PROMPT =
+  '这是一份公开的练习卷，请你提供可以直接作为标准阅卷参考的"满分版"解答：\n' +
+  '\n' +
+  '步骤详尽：给出包含所有中间计算和引用定理的完整推导过程。\n' +
+  '逻辑严密：步骤之间需有清晰的逻辑推导衔接。\n' +
+  '\n' +
+  '【输出格式硬性要求 — 答案会被发到即时通讯软件，必须照做】\n' +
+  '1. 严禁使用 LaTeX。不要写 \\frac \\sum \\int \\sqrt \\cdot ^{} _{} 这类语法。\n' +
+  '   所有数学符号请直接用 Unicode 字符：\n' +
+  '   分数 → 直接写 (a)/(b) 或 ½ ⅓ ¼；\n' +
+  '   积分 → ∫ ∮；求和 → ∑；连乘 → ∏；根号 → √；\n' +
+  '   上标 → ¹ ² ³ ⁰ ⁿ；下标 → ₁ ₂ ₙ；\n' +
+  '   ± × ÷ · ≈ ≠ ≤ ≥ ∞ ∈ ∉ ∋ ⊂ ⊃ ∪ ∩ ∅ ∀ ∃ ⇒ ⇔ → ← ↔；\n' +
+  '   希腊字母直接用 α β γ δ ε θ λ μ π σ φ ψ ω Δ Σ Π Ω；\n' +
+  '   矩阵/向量请用横向描述，例如 v = (1, 2, 3)。\n' +
+  '2. 严禁使用 markdown 标题（# ## ### 一律禁止）。需要分小节时用粗体行：**1. 题目分析** 这种形式。\n' +
+  '3. 段落之间最多空一行。不要为了好看插大量空行。\n' +
+  '4. 答题语言：中文。';
+
+let relay = null;            // TelegramRelay instance (may be null)
+let relayTabId = null;       // dedicated ChatGPT tab for the relay
+let relayWindowId = null;    // window hosting the ChatGPT tab (own window so SSE isn't throttled)
+let relayWaTabId = null;     // dedicated WhatsApp Web tab
+let relayWaWindowId = null;  // window hosting the WhatsApp tab
+let relayBusy = false;       // serialise concurrent batches (in-memory only — storage holds the source of truth)
+const relayLog = [];         // ring buffer of recent log lines for the UI
+
+// =================== Pipeline persistence helpers ===================
+
+function batchIdFor(batch) {
+  // chat + first-msg id is unique per Telegram channel batch. We also fall
+  // back to a timestamp if something weird sneaks through (shouldn't).
+  return `${batch.chatId}:${batch.msgId ?? batch.queuedAt ?? Date.now()}`;
+}
+
+async function queueLoad() {
+  const r = await chrome.storage.local.get(RELAY_KEYS.queue);
+  return Array.isArray(r[RELAY_KEYS.queue]) ? r[RELAY_KEYS.queue] : [];
+}
+async function queueSave(arr) {
+  await chrome.storage.local.set({ [RELAY_KEYS.queue]: arr });
+}
+
+async function inFlightLoad() {
+  const r = await chrome.storage.local.get(RELAY_KEYS.inFlight);
+  return r[RELAY_KEYS.inFlight] || null;
+}
+async function inFlightSet(batch) {
+  await chrome.storage.local.set({ [RELAY_KEYS.inFlight]: batch || null });
+}
+
+async function isProcessedId(id) {
+  const r = await chrome.storage.local.get(RELAY_KEYS.processed);
+  return !!(r[RELAY_KEYS.processed]?.[id]);
+}
+async function markProcessed(id) {
+  const r = await chrome.storage.local.get(RELAY_KEYS.processed);
+  const m = r[RELAY_KEYS.processed] || {};
+  m[id] = Date.now();
+  // Trim — keep newest N entries.
+  const entries = Object.entries(m).sort((a, b) => b[1] - a[1]).slice(0, RELAY_PROCESSED_KEEP);
+  await chrome.storage.local.set({ [RELAY_KEYS.processed]: Object.fromEntries(entries) });
+}
+
+// Recover any work the previous SW life left behind.
+async function recoverRelayState() {
+  const inFlight = await inFlightLoad();
+  let queue = await queueLoad();
+  if (inFlight) {
+    // SW died mid-flight; put it back at the head for a fresh attempt.
+    queue.unshift(inFlight);
+    await inFlightSet(null);
+  }
+  // Drop stale batches (older than RELAY_QUEUE_MAX_AGE_MS).
+  const now = Date.now();
+  const fresh = queue.filter(b => now - (b.queuedAt ?? now) < RELAY_QUEUE_MAX_AGE_MS);
+  const dropped = queue.length - fresh.length;
+  await queueSave(fresh);
+  if (dropped) logRelay(`recovery: dropped ${dropped} stale batch(es) (older than ${RELAY_QUEUE_MAX_AGE_MS/60000}min)`);
+  if (fresh.length) logRelay(`recovery: ${fresh.length} batch(es) queued, attempting to resume`);
+  // Kick the drain loop on next tick.
+  setTimeout(() => drainQueueIfIdle().catch(err => logRelay(`recovery drain crash: ${err.message ?? err}`)), 500);
+  return fresh.length;
+}
+
+async function drainQueueIfIdle() {
+  if (relayBusy) return;
+  const q = await queueLoad();
+  if (q.length === 0) return;
+  const next = q.shift();
+  await queueSave(q);
+  handleRelayBatch(next).catch(err => logRelay(`drain crash: ${err.message ?? err}`));
+}
+
+function logRelay(line) {
+  const ts = new Date().toISOString().slice(11, 19);
+  const entry = `[${ts}] ${line}`;
+  relayLog.push(entry);
+  if (relayLog.length > 80) relayLog.shift();
+  try { console.log('[relay]', entry); } catch (_) {}
+}
+
+async function getRelayConfig() {
+  const stored = await chrome.storage.local.get(Object.values(RELAY_KEYS));
+  // Default both destinations on for new installs; if either was explicitly
+  // set false earlier, honor that.
+  const destTg = stored[RELAY_KEYS.destTelegram];
+  const destWa = stored[RELAY_KEYS.destWhatsapp];
+  return {
+    enabled:          !!stored[RELAY_KEYS.enabled],
+    token:            stored[RELAY_KEYS.token] || '',
+    allowedUserId:    stored[RELAY_KEYS.allowedUserId] || null,
+    allowedChannelId: stored[RELAY_KEYS.allowedChannelId] || null,
+    prompt:           stored[RELAY_KEYS.prompt] || RELAY_DEFAULT_PROMPT,
+    waPhone:          stored[RELAY_KEYS.waPhone] || '',
+    destTelegram:     destTg === undefined ? true : !!destTg,
+    destWhatsapp:     destWa === undefined ? true : !!destWa,
+    keepTabs:         !!stored[RELAY_KEYS.keepTabs],
+  };
+}
+
+async function startRelayFromConfig() {
+  const cfg = await getRelayConfig();
+  if (!cfg.enabled) { logRelay('relay disabled'); return false; }
+  if (!cfg.token)   { logRelay('relay: no token configured'); return false; }
+  if (!cfg.waPhone) { logRelay('relay: no WhatsApp phone configured'); return false; }
+
+  if (relay && relay.running) {
+    logRelay('relay: already running');
+    return true;
+  }
+  relay = new TelegramRelay({
+    token: cfg.token,
+    allowedUserId: cfg.allowedUserId ? Number(cfg.allowedUserId) : null,
+    allowedChannelId: cfg.allowedChannelId ? Number(cfg.allowedChannelId) : null,
+    onLog: logRelay,
+    onBatch: (batch) => handleRelayBatch(batch).catch(err => {
+      logRelay(`batch handler crash: ${err.message ?? err}`);
+    })
+  });
+  await relay.start();
+  return true;
+}
+
+function stopRelay() {
+  if (relay) {
+    relay.stop();
+    relay = null;
+  }
+}
+
+async function handleRelayBatch(batch) {
+  // Normalise: every batch has an id, a queuedAt, and an attempt counter.
+  if (!batch.batchId)      batch.batchId = batchIdFor(batch);
+  if (!batch.queuedAt)     batch.queuedAt = Date.now();
+  if (!batch.attemptCount) batch.attemptCount = 0;
+
+  // Dedup: if we already finished this exact batch, drop on the floor.
+  if (await isProcessedId(batch.batchId)) {
+    logRelay(`batch ${batch.batchId} already processed — skipping duplicate`);
+    return;
+  }
+
+  // If currently busy, persist to storage queue and return.
+  if (relayBusy) {
+    const q = await queueLoad();
+    q.push(batch);
+    await queueSave(q);
+    logRelay(`batch queued (busy): ${batch.images.length} photos · queue=${q.length}`);
+    if (relay) await relay.sendText(batch.chatId,
+      `📋 Queued behind current batch (${q.length} ahead) — will process automatically.`);
+    return;
+  }
+
+  relayBusy = true;
+  await inFlightSet(batch);
+  const cfg = await getRelayConfig();
+
+  try {
+    // Wall-clock safety net: no single batch may pin the queue for more than
+    // BATCH_HARD_TIMEOUT_MS, no matter what hangs inside (tab unresponsive,
+    // executeScript stuck, etc.). Promise.race lets us bail out and free the
+    // queue even if internal awaits never resolve.
+    const BATCH_HARD_TIMEOUT_MS = 12 * 60 * 1000; // 12 min
+    await Promise.race([
+      processBatchWithRetries(batch, cfg),
+      new Promise((_, rej) => setTimeout(
+        () => rej(new Error(`batch wall-clock timeout (${BATCH_HARD_TIMEOUT_MS/60000} min)`)),
+        BATCH_HARD_TIMEOUT_MS
+      )),
+    ]);
+    await markProcessed(batch.batchId);
+  } catch (err) {
+    logRelay(`batch ${batch.batchId} ultimately failed: ${err.message ?? err}`);
+    if (relay) await relay.sendText(batch.chatId, `❌ Gave up after ${batch.attemptCount} attempt(s): ${err.message ?? err}`);
+    // Still mark processed so we don't infinite-loop on the same bad batch
+    // after SW restart. User can resend manually if they want.
+    await markProcessed(batch.batchId);
+  } finally {
+    relayBusy = false;
+    await inFlightSet(null);
+
+    // Drain next from the storage queue.
+    const remaining = await queueLoad();
+    if (remaining.length > 0) {
+      const next = remaining.shift();
+      await queueSave(remaining);
+      logRelay(`relay: starting next queued batch (${remaining.length} still queued)`);
+      setTimeout(() => handleRelayBatch(next).catch(err => {
+        logRelay(`queued batch crash: ${err.message ?? err}`);
+      }), 100);
+    } else if (!cfg.keepTabs) {
+      setTimeout(closeRelayTabs, 3000);
+    } else {
+      logRelay('relay: keepTabs on — leaving windows open for inspection');
+    }
+  }
+}
+
+// Runs one batch, retrying ChatGPT-side failures with exponential backoff.
+// Delivery failures handle their own retries inside deliverAnswer.
+async function processBatchWithRetries(batch, cfg) {
+  let lastErr;
+  while (batch.attemptCount < RELAY_MAX_ATTEMPTS) {
+    batch.attemptCount++;
+    await inFlightSet(batch); // persist updated counter
+    try {
+      await processBatch(batch, cfg);
+      return; // success
+    } catch (err) {
+      lastErr = err;
+      const isLast = batch.attemptCount >= RELAY_MAX_ATTEMPTS;
+      logRelay(`batch ${batch.batchId} attempt ${batch.attemptCount}/${RELAY_MAX_ATTEMPTS} failed: ${err.message ?? err}${isLast ? ' — giving up' : ''}`);
+      if (relay && !isLast) {
+        await relay.sendText(batch.chatId,
+          `⚠️ Attempt ${batch.attemptCount}/${RELAY_MAX_ATTEMPTS} failed: ${err.message ?? err}\nRetrying...`);
+      }
+      if (isLast) break;
+      // Exponential backoff: 5s, 15s
+      const wait = 5000 * Math.pow(3, batch.attemptCount - 1);
+      await new Promise(r => setTimeout(r, wait));
+    }
+  }
+  throw lastErr;
+}
+
+// Common ChatGPT error / refusal strings (case-insensitive substrings).
+// If the answer matches one of these, treat the whole batch as failed and retry.
+const CHATGPT_ERROR_PATTERNS = [
+  /something went wrong/i,
+  /please try again/i,
+  /try again later/i,
+  /network error/i,
+  /you're sending messages too quickly/i,
+  /rate.?limit/i,
+  /i'?m sorry,?\s*but/i,
+  /i can'?t (help|assist) with/i,
+  /unable to (process|help|assist)/i,
+  /无法处理/,
+  /出错了/,
+  /稍后再试/,
+  /请稍后/,
+  /出现了一个错误/,
+];
+
+// Decide whether a polled answer should be accepted or rejected (→ retry).
+// Returns { ok: true } or { ok: false, reason: '...' }.
+function classifyAnswer(text, imageCount) {
+  if (!text) return { ok: false, reason: 'empty' };
+  if (text.length < 30) return { ok: false, reason: 'too short (<30)' };
+
+  // Error-string blacklist — only triggers if the answer is *also* short.
+  // A long answer that happens to contain "please try again" near the end
+  // (e.g. as advice) shouldn't be rejected.
+  if (text.length < 600) {
+    for (const re of CHATGPT_ERROR_PATTERNS) {
+      if (re.test(text)) return { ok: false, reason: `error string: ${re}` };
+    }
+  }
+
+  // Multi-image low-density heuristic: ≥3 images but very few chars/image
+  // strongly suggests ChatGPT errored out or only solved 1 of N.
+  if (imageCount >= 3) {
+    const perImg = text.length / imageCount;
+    if (perImg < 80) {
+      return { ok: false, reason: `low density (${Math.round(perImg)} chars/img, expected ≥80)` };
+    }
+  }
+
+  return { ok: true };
+}
+
+async function processBatch(batch, cfg) {
+  const prompt = batch.caption?.trim() || cfg.prompt;
+  if (relay) await relay.sendText(batch.chatId,
+    `⏳ Got ${batch.images.length} photo(s) — running ChatGPT (attempt ${batch.attemptCount}/${RELAY_MAX_ATTEMPTS})...`);
+
+  const tabId = await getOrCreateRelayChatgptTab();
+  await waitForChatgptReady(tabId);
+
+  logRelay(`sending ${batch.images.length} images to ChatGPT (tab ${tabId})`);
+  const submitRes = await sendMessageToTopFrame(tabId, {
+    type: 'SUBMIT_WITH_ATTACHMENTS',
+    prompt,
+    images: batch.images
+  });
+  if (!submitRes?.ok) throw new Error('submit failed: ' + (submitRes?.error || 'unknown'));
+  if (submitRes.attach) logRelay(`attach: ${submitRes.attach.count} files via ${submitRes.attach.strategy}`);
+
+  const answer = await pollChatgptAnswer(tabId);
+  const verdict = classifyAnswer(answer, batch.images.length);
+  if (!verdict.ok) {
+    throw new Error(`ChatGPT answer rejected: ${verdict.reason} (${answer?.length ?? 0} chars, ${batch.images.length} imgs)`);
+  }
+
+  logRelay(`got answer (${answer.length} chars), delivering`);
+
+  // Cache answer immediately — even if both deliveries fail, the user can
+  // resend from sidepanel without re-burning ChatGPT.
+  await chrome.storage.local.set({
+    [RELAY_KEYS.lastAnswer]: {
+      text: answer,
+      batchId: batch.batchId,
+      chatId: batch.chatId,
+      ts: Date.now(),
+      source: batch.source,
+      imageCount: batch.images.length,
+      prompt: prompt.slice(0, 200),
+    }
+  });
+
+  if (relay) await relay.sendText(batch.chatId, `✅ ChatGPT done (${answer.length} chars). Delivering...`);
+  await deliverAnswer(answer, batch.chatId, cfg);
+}
+
+// Per-destination retry helper. Each destination gets its own retries so a
+// transient WhatsApp failure doesn't keep Telegram from succeeding.
+async function deliverAnswer(answer, replyChatId, cfg) {
+  const tasks = [];
+  if (cfg.destTelegram) {
+    tasks.push(retryAsync(
+      async () => {
+        const r = await relay.sendAnswerHtml(replyChatId, answer);
+        return { dest: 'telegram', ok: true, info: `${r.chunks} chunk(s)` };
+      },
+      { tries: 3, baseDelayMs: 3000, label: 'telegram' }
+    ).catch(err => ({ dest: 'telegram', ok: false, error: err.message ?? String(err) })));
+  }
+  if (cfg.destWhatsapp) {
+    tasks.push(retryAsync(
+      async () => {
+        if (!cfg.waPhone) throw new Error('no WhatsApp phone configured');
+        const r = await deliverToWhatsapp(cfg.waPhone, answer);
+        if (!r.ok) throw new Error(r.error || 'unknown');
+        return { dest: 'whatsapp', ok: true };
+      },
+      { tries: 3, baseDelayMs: 5000, label: 'whatsapp' }
+    ).catch(err => ({ dest: 'whatsapp', ok: false, error: err.message ?? String(err) })));
+  }
+  if (tasks.length === 0) {
+    logRelay('no destinations enabled — answer cached only');
+    if (relay) await relay.sendText(replyChatId, '⚠️ No destination enabled in extension settings (answer cached, use sidepanel to resend).');
+    return;
+  }
+  const results = await Promise.all(tasks);
+  for (const r of results) {
+    if (r.ok) logRelay(`✓ ${r.dest}: ${r.info || 'ok'}`);
+    else      logRelay(`✗ ${r.dest}: ${r.error}`);
+  }
+  const summary = results
+    .map(r => `${r.ok ? '✅' : '❌'} ${r.dest}${r.ok ? '' : ' (' + r.error + ')'}`)
+    .join(' · ');
+  const anyFail = results.some(r => !r.ok);
+  if (anyFail) {
+    if (relay) await relay.sendText(replyChatId, `${summary}\n💾 Answer cached — use sidepanel "重发上次答案" to retry failed destinations.`);
+  } else {
+    if (relay) await relay.sendText(replyChatId, summary);
+  }
+}
+
+async function retryAsync(fn, { tries = 3, baseDelayMs = 3000, label = 'op' } = {}) {
+  let err;
+  for (let i = 1; i <= tries; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      err = e;
+      if (i < tries) {
+        const wait = baseDelayMs * i;
+        logRelay(`${label} attempt ${i}/${tries} failed (${e.message ?? e}) — retrying in ${wait/1000}s`);
+        await new Promise(r => setTimeout(r, wait));
+      }
+    }
+  }
+  throw err;
+}
+
+async function closeRelayTabs() {
+  // Close the whole windows rather than just the tabs — both relay tabs
+  // live alone in their own background windows, so removing the window is
+  // cleaner and definitely won't leave an orphan window behind.
+  const winIds = [relayWindowId, relayWaWindowId].filter(id => id != null);
+  if (winIds.length === 0 && relayTabId == null && relayWaTabId == null) return;
+  for (const id of winIds) {
+    try { await chrome.windows.remove(id); } catch (_) {}
+  }
+  // Fallback for the legacy path where a tab exists without a tracked window.
+  for (const id of [relayTabId, relayWaTabId]) {
+    if (id != null) {
+      try { await chrome.tabs.remove(id); } catch (_) {}
+    }
+  }
+  logRelay(`relay: closed relay window(s)`);
+  relayTabId = null;
+  relayWaTabId = null;
+  relayWindowId = null;
+  relayWaWindowId = null;
+}
+
+async function getOrCreateRelayChatgptTab() {
+  // Plain new-chat URL (NOT ?temporary-chat=true). Temp-chat mode has been
+  // unreliable lately — submissions can hang on the OpenAI side. Trade-off:
+  // every batch now leaves history in the user's ChatGPT sidebar.
+  const startUrl = 'https://chatgpt.com/';
+  if (relayTabId != null) {
+    try {
+      await chrome.tabs.get(relayTabId);
+      // Reset to a fresh chat so each batch is independent.
+      await chrome.tabs.update(relayTabId, { url: startUrl, active: false });
+      return relayTabId;
+    } catch (_) {
+      relayTabId = null;
+      relayWindowId = null;
+    }
+  }
+  // Open the ChatGPT relay window in the foreground. We can't truly force
+  // Chrome to steal focus from another foreground app (Windows blocks
+  // SetForegroundWindow from background processes by design), but we do
+  // everything an extension is allowed to do:
+  //   focused:true + drawAttention:true  → taskbar flashes, user notices
+  //   state: maximized                   → next time Chrome comes forward, it's huge
+  //   repeated update calls              → occasionally bypasses the lock
+  const win = await chrome.windows.create({
+    url: startUrl,
+    type: 'normal',
+    focused: true,
+    width: 1280,
+    height: 900
+  });
+  relayWindowId = win.id;
+  relayTabId = win.tabs?.[0]?.id ?? null;
+
+  // Belt-and-suspenders: maximize + flash taskbar + retry focus a couple
+  // times. drawAttention only works when the window isn't already focused
+  // by Windows, so it's the actual signal you'll see if Chrome was hidden.
+  try {
+    await chrome.windows.update(win.id, {
+      focused: true,
+      state: 'maximized',
+      drawAttention: true
+    });
+  } catch (_) {}
+  // One more retry after a short delay — sometimes Windows accepts the
+  // foreground transition only after the window has finished its initial
+  // creation animation.
+  setTimeout(() => {
+    chrome.windows.update(win.id, {
+      focused: true,
+      drawAttention: true
+    }).catch(() => {});
+  }, 600);
+
+  return relayTabId;
+}
+
+async function waitForChatgptReady(tabId, timeoutMs = 30000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab.status === 'complete') {
+        // Confirm content script is alive by trying to invoke the poll fn.
+        const [{ result } = {}] = await chrome.scripting.executeScript({
+          target: { tabId, frameIds: [0] },
+          func: () => typeof window.__multiAIPollState === 'function'
+        });
+        if (result) return;
+      }
+    } catch (_) {}
+    await new Promise(r => setTimeout(r, 400));
+  }
+  throw new Error('ChatGPT tab not ready within timeout');
+}
+
+async function sendMessageToTopFrame(tabId, message) {
+  // chrome.tabs.sendMessage broadcasts to all frames; targeting top frame
+  // by frameId 0 makes sure only content_adapter.js (which only registers
+  // when isDirectChildOfTop) receives it.
+  return new Promise((resolve, reject) => {
+    chrome.tabs.sendMessage(tabId, message, { frameId: 0 }, (resp) => {
+      const err = chrome.runtime.lastError;
+      if (err) reject(new Error(err.message));
+      else resolve(resp);
+    });
+  });
+}
+
+async function pollChatgptAnswer(tabId, { timeoutMs = 10 * 60 * 1000 } = {}) {
+  // Three "done" detection paths, tried in order each tick:
+  //
+  // (1) Standard ChatGPT (GPT-4o etc.): the assistant bubble carries
+  //     data-message-status. Terminal value → done immediately.
+  // (2) Reasoning models (o1/o3/o4 "Thought for X"): no status attribute.
+  //     The answer appears in one burst AFTER the stop button disappears,
+  //     with a real lag between "thinking done" and "answer visible in DOM"
+  //     that exceeded our old 18s stability window. We instead watch the
+  //     assistant message's RAW textContent length — once it stops growing
+  //     for NO_GROWTH_DONE_MS, we're done.
+  // (3) Hard timeout safety net.
+  const TERMINAL_STATUSES = new Set([
+    'finished_successfully',
+    'finished_partial_completion',
+    'finished_partial_image_generation',
+    'finished_safety',
+    'finished',
+  ]);
+  const STREAMING_STATUSES = new Set([
+    'streaming',
+    'in_progress',
+    'finished_pending_continuation',
+  ]);
+  const POLL_MS = 1500;
+  const NO_GROWTH_DONE_MS = 60000;  // 60s of no textContent growth → done
+  const MIN_TEXT_TO_FINISH = 50;     // never finish on a near-empty bubble
+
+  const start = Date.now();
+  let peakLen = 0;
+  let lastGrowthAt = Date.now();
+  let lastResult = null;
+  let firstSeenAt = 0;
+  let lastStateKey = '';
+
+  while (Date.now() - start < timeoutMs) {
+    await new Promise(r => setTimeout(r, POLL_MS));
+    let result;
+    try {
+      const r = await chrome.scripting.executeScript({
+        target: { tabId, frameIds: [0] },
+        func: () => window.__multiAIPollState ? window.__multiAIPollState() : { error: 'no_poll_fn' }
+      });
+      result = r?.[0]?.result;
+    } catch (e) {
+      continue; // tab transitioning
+    }
+    if (!result || result.error) continue;
+    lastResult = result;
+    if ((result.fullTextLen || result.text) && !firstSeenAt) {
+      firstSeenAt = Date.now();
+    }
+
+    // textContent length is the ground truth for "is the bubble growing".
+    // Reset growth timer on any increase — even 1 byte counts.
+    const fullLen = result.fullTextLen || 0;
+    if (fullLen > peakLen) {
+      peakLen = fullLen;
+      lastGrowthAt = Date.now();
+    }
+
+    // Diagnostic log on state transition.
+    const stateKey = `${result.messageStatus ?? 'null'}|stream=${result.streaming}|stop=${result.stopVisible}|reason=${!!result.reasoning}|analyzing=${!!result.analyzingImages}|msgs=${result.messageCount}`;
+    if (stateKey !== lastStateKey) {
+      logRelay(`poll: status=${result.messageStatus ?? 'null'} stream=${result.streaming} stop=${result.stopVisible} reason=${!!result.reasoning} analyzing=${!!result.analyzingImages} msgs=${result.messageCount} text=${result.text?.length ?? 0}c full=${fullLen}c peak=${peakLen}c`);
+      lastStateKey = stateKey;
+    }
+
+    // (1) Authoritative status, if present.
+    if (result.messageStatus) {
+      if (TERMINAL_STATUSES.has(result.messageStatus)) {
+        logRelay(`poll: terminal status "${result.messageStatus}" — done`);
+        return result.text;
+      }
+      if (STREAMING_STATUSES.has(result.messageStatus)) {
+        lastGrowthAt = Date.now(); // keep timer reset while explicitly streaming
+        continue;
+      }
+    }
+
+    // Still working — reset the no-growth timer.
+    if (result.streaming || result.stopVisible || result.reasoning || result.analyzingImages) {
+      lastGrowthAt = Date.now();
+
+      // EARLY-ABORT for hung image analysis: if "正在分析" has been visible
+      // with NO real answer text growing for ANALYZING_HANG_MS, the vision
+      // backend is stalled — abort so the batch can retry with a fresh tab
+      // (much faster than waiting 10 min for the full timeout).
+      const ANALYZING_HANG_MS = 4 * 60 * 1000;
+      if (result.analyzingImages && peakLen < MIN_TEXT_TO_FINISH && Date.now() - start > ANALYZING_HANG_MS) {
+        throw new Error(`stuck on "正在分析" for ${(Date.now()-start)/60000 | 0} min with no answer text`);
+      }
+      continue;
+    }
+
+    // (2) Heuristic done: no stream/stop indicator + no textContent growth
+    // for NO_GROWTH_DONE_MS + we have at least SOMETHING.
+    if (peakLen >= MIN_TEXT_TO_FINISH && Date.now() - lastGrowthAt > NO_GROWTH_DONE_MS) {
+      logRelay(`poll: no growth ${(Date.now() - lastGrowthAt)/1000 | 0}s, peak=${peakLen}c — done`);
+      return result.text;
+    }
+
+    // Safety: if 3 min elapsed without ANY text appearing, give up.
+    if (!firstSeenAt && Date.now() - start > 180000) {
+      throw new Error('ChatGPT produced no text in 3 min');
+    }
+  }
+  if (lastResult?.text) return lastResult.text;
+  throw new Error('answer poll timed out');
+}
+
+async function deliverToWhatsapp(phone, text) {
+  const cleanPhone = phone.replace(/[^\d+]/g, '').replace(/^\+/, '');
+  const url = `https://web.whatsapp.com/send?phone=${cleanPhone}`;
+
+  if (relayWaTabId != null) {
+    try {
+      await chrome.tabs.get(relayWaTabId);
+      await chrome.tabs.update(relayWaTabId, { url, active: false });
+    } catch (_) {
+      relayWaTabId = null;
+      relayWaWindowId = null;
+    }
+  }
+  if (relayWaTabId == null) {
+    // Same dedicated-window trick as ChatGPT — keeps the tab visible so
+    // WA Web's send pipeline doesn't get throttled while we're not
+    // looking at it.
+    const win = await chrome.windows.create({
+      url,
+      type: 'normal',
+      focused: false,
+      width: 1280,
+      height: 900
+    });
+    relayWaWindowId = win.id;
+    relayWaTabId = win.tabs?.[0]?.id ?? null;
+  }
+
+  // Wait for tab to finish loading before talking to the content script.
+  await waitForTabComplete(relayWaTabId, 30000);
+
+  // The content script may not be ready immediately even after status==complete
+  // (WA Web does a long client-side init). Retry sendMessage until it answers.
+  const deadline = Date.now() + 90000;
+  while (Date.now() < deadline) {
+    try {
+      const r = await new Promise((resolve, reject) => {
+        chrome.tabs.sendMessage(relayWaTabId, { type: 'WHATSAPP_SEND', text }, (resp) => {
+          const err = chrome.runtime.lastError;
+          if (err) reject(new Error(err.message));
+          else resolve(resp);
+        });
+      });
+      if (r?.ok) return { ok: true };
+      if (r && r.ok === false) return { ok: false, error: r.error };
+    } catch (_) {
+      // content script not yet there — keep retrying
+    }
+    await new Promise(r => setTimeout(r, 1500));
+  }
+  return { ok: false, error: 'whatsapp content script never responded' };
+}
+
+async function waitForTabComplete(tabId, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const t = await chrome.tabs.get(tabId);
+      if (t.status === 'complete') return;
+    } catch (_) {
+      throw new Error('relay tab disappeared');
+    }
+    await new Promise(r => setTimeout(r, 400));
+  }
+}
+
+// Auto-start on SW boot if user previously enabled the relay. Each path also
+// runs recoverRelayState() so any batch that was mid-flight or queued when
+// the previous SW life ended gets picked up and retried.
+async function bootRelay(reason) {
+  try {
+    await recoverRelayState();
+  } catch (err) {
+    logRelay(`${reason} recover: ${err.message ?? err}`);
+  }
+  try {
+    await startRelayFromConfig();
+  } catch (err) {
+    logRelay(`${reason} start: ${err.message ?? err}`);
+  }
+}
+
+chrome.runtime.onStartup?.addListener(() => { bootRelay('onStartup'); });
+chrome.runtime.onInstalled.addListener(() => { bootRelay('onInstalled'); });
+
+// Best-effort wake-up: if SW was killed mid-poll, this re-arms the poller.
+try {
+  chrome.alarms.create('tg-relay-tick', { periodInMinutes: 1 });
+  chrome.alarms.onAlarm.addListener(async (a) => {
+    if (a.name !== 'tg-relay-tick') return;
+    const cfg = await getRelayConfig();
+    if (cfg.enabled && (!relay || !relay.running)) {
+      bootRelay('alarm');
+    } else if (cfg.enabled) {
+      // Poller is alive; just check the storage queue in case a batch is
+      // sitting there with no one picking it up.
+      drainQueueIfIdle().catch(() => {});
+    }
+  });
+} catch (_) {}
+
+// Best-effort cold start: if module re-evaluates on SW wake-up, recover state
+// and start the poller.
+bootRelay('module-eval');
+
 // =================== Message dispatcher ===================
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -1722,6 +2654,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     })();
     return true;
   }
+  if (msg.type === 'CLEAN_GEMINI_HISTORY') {
+    cleanGeminiHistory()
+      .then(result => sendResponse({ ok: true, ...result }))
+      .catch(err => sendResponse({ ok: false, error: err.message ?? String(err) }));
+    return true;
+  }
   if (msg.type === 'GRID_STATUS') {
     const map = providerFrames.get(gridTabId) ?? {};
     sendResponse({ ok: true, gridTabId, frames: map });
@@ -1741,6 +2679,127 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     collectDebug()
       .then(data => sendResponse({ ok: true, data }))
       .catch(err => sendResponse({ ok: false, error: err.message ?? String(err) }));
+    return true;
+  }
+  if (msg.type === 'RELAY_GET_CONFIG') {
+    (async () => {
+      try {
+        const cfg = await getRelayConfig();
+        const stored = await chrome.storage.local.get([
+          RELAY_KEYS.lastAnswer, RELAY_KEYS.queue, RELAY_KEYS.inFlight
+        ]);
+        sendResponse({
+          ok: true,
+          config: cfg,
+          running: !!(relay && relay.running),
+          log: relayLog.slice(-30),
+          lastAnswer: stored[RELAY_KEYS.lastAnswer] || null,
+          queueLength: (stored[RELAY_KEYS.queue] || []).length,
+          inFlight: !!stored[RELAY_KEYS.inFlight]
+        });
+      } catch (err) {
+        sendResponse({ ok: false, error: err.message ?? String(err) });
+      }
+    })();
+    return true;
+  }
+  if (msg.type === 'RELAY_RESEND_LAST') {
+    (async () => {
+      try {
+        const stored = await chrome.storage.local.get(RELAY_KEYS.lastAnswer);
+        const cached = stored[RELAY_KEYS.lastAnswer];
+        if (!cached || !cached.text) {
+          sendResponse({ ok: false, error: '没有缓存的答案可重发' });
+          return;
+        }
+        if (relayBusy) {
+          sendResponse({ ok: false, error: '当前有 batch 在跑，请等它完成再重发' });
+          return;
+        }
+        const cfg = await getRelayConfig();
+        relayBusy = true;
+        try {
+          logRelay(`resend: replaying cached answer (${cached.text.length} chars) from ${new Date(cached.ts).toLocaleTimeString()}`);
+          await deliverAnswer(cached.text, cached.chatId, cfg);
+          sendResponse({ ok: true });
+        } finally {
+          relayBusy = false;
+          // Don't drain queue here — that's the poller's job.
+        }
+      } catch (err) {
+        sendResponse({ ok: false, error: err.message ?? String(err) });
+      }
+    })();
+    return true;
+  }
+  if (msg.type === 'RELAY_CLEAR_QUEUE') {
+    (async () => {
+      try {
+        await queueSave([]);
+        await inFlightSet(null);
+        // CRITICAL: also reset the in-memory busy flag. Otherwise if a
+        // previous batch hung mid-flight, the SW is still alive with
+        // relayBusy=true and new batches will keep queueing forever.
+        relayBusy = false;
+        logRelay('relay: queue cleared + busy flag reset by user');
+        sendResponse({ ok: true });
+      } catch (err) {
+        sendResponse({ ok: false, error: err.message ?? String(err) });
+      }
+    })();
+    return true;
+  }
+  if (msg.type === 'RELAY_UNSTICK') {
+    (async () => {
+      try {
+        await inFlightSet(null);
+        relayBusy = false;
+        logRelay('relay: manual unstick — busy flag reset, queue preserved');
+        // Try to drain whatever is still queued.
+        const q = await queueLoad();
+        if (q.length > 0) {
+          const next = q.shift();
+          await queueSave(q);
+          logRelay(`relay: resuming queued batch (${q.length} still queued)`);
+          setTimeout(() => handleRelayBatch(next).catch(e =>
+            logRelay(`unstick drain crash: ${e.message ?? e}`)), 100);
+        }
+        sendResponse({ ok: true, queueLength: q.length });
+      } catch (err) {
+        sendResponse({ ok: false, error: err.message ?? String(err) });
+      }
+    })();
+    return true;
+  }
+  if (msg.type === 'RELAY_SET_CONFIG') {
+    (async () => {
+      try {
+        const patch = msg.patch || {};
+        const out = {};
+        if (typeof patch.enabled === 'boolean') out[RELAY_KEYS.enabled] = patch.enabled;
+        if (typeof patch.token === 'string')    out[RELAY_KEYS.token] = patch.token.trim();
+        if ('allowedUserId' in patch) {
+          const v = patch.allowedUserId;
+          out[RELAY_KEYS.allowedUserId] = v === '' || v == null ? null : Number(v);
+        }
+        if ('allowedChannelId' in patch) {
+          const v = patch.allowedChannelId;
+          out[RELAY_KEYS.allowedChannelId] = v === '' || v == null ? null : Number(v);
+        }
+        if (typeof patch.prompt === 'string')   out[RELAY_KEYS.prompt] = patch.prompt;
+        if (typeof patch.waPhone === 'string')  out[RELAY_KEYS.waPhone] = patch.waPhone.trim();
+        if (typeof patch.destTelegram === 'boolean') out[RELAY_KEYS.destTelegram] = patch.destTelegram;
+        if (typeof patch.destWhatsapp === 'boolean') out[RELAY_KEYS.destWhatsapp] = patch.destWhatsapp;
+        if (typeof patch.keepTabs === 'boolean')     out[RELAY_KEYS.keepTabs] = patch.keepTabs;
+        await chrome.storage.local.set(out);
+        // Re-arm: stop existing instance, start fresh if enabled.
+        stopRelay();
+        const started = await startRelayFromConfig();
+        sendResponse({ ok: true, running: started });
+      } catch (err) {
+        sendResponse({ ok: false, error: err.message ?? String(err) });
+      }
+    })();
     return true;
   }
 });
