@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>WhatsApp 单次发送</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      background: #f5f5f5;
+      color: #222;
+    }
+    .card {
+      width: min(760px, calc(100vw - 32px));
+      margin: 40px auto;
+      background: #fff;
+      border: 1px solid #ddd;
+      border-radius: 14px;
+      padding: 24px;
+      box-shadow: 0 8px 28px rgba(0,0,0,.08);
+    }
+    h1 { margin: 0 0 8px; font-size: 24px; }
+    p { color: #666; line-height: 1.55; }
+    label { display: block; margin: 18px 0 6px; font-size: 13px; font-weight: 600; }
+    input, textarea {
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid #ccc;
+      border-radius: 8px;
+      padding: 10px 12px;
+      font: inherit;
+      background: #fff;
+      color: #222;
+    }
+    textarea { min-height: 220px; resize: vertical; line-height: 1.5; }
+    .row { display: flex; align-items: center; gap: 10px; margin-top: 14px; }
+    .row input[type="checkbox"] { width: auto; }
+    button {
+      margin-top: 18px;
+      border: 0;
+      border-radius: 9px;
+      padding: 11px 18px;
+      font: inherit;
+      font-weight: 600;
+      cursor: pointer;
+      background: #128c7e;
+      color: #fff;
+    }
+    button:disabled { opacity: .55; cursor: default; }
+    #wa-status { margin-top: 14px; min-height: 22px; font-size: 13px; }
+    #wa-status[data-kind="ok"] { color: #087f5b; }
+    #wa-status[data-kind="error"] { color: #b42318; }
+    #wa-status[data-kind="busy"] { color: #8a5a00; }
+    .note {
+      margin-top: 20px;
+      padding: 12px 14px;
+      border-radius: 8px;
+      background: #f4f4f4;
+      color: #666;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    @media (prefers-color-scheme: dark) {
+      body { background: #171717; color: #eee; }
+      .card { background: #222; border-color: #3b3b3b; box-shadow: none; }
+      p, .note { color: #aaa; }
+      input, textarea { background: #191919; color: #eee; border-color: #555; }
+      .note { background: #191919; }
+      #wa-status[data-kind="ok"] { color: #63d7ad; }
+      #wa-status[data-kind="error"] { color: #ff8c82; }
+      #wa-status[data-kind="busy"] { color: #e7bd68; }
+    }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>WhatsApp 单次发送</h1>
+    <p>复用当前 Chrome 已登录的 WhatsApp Web。号码建议使用 E.164，例如 <code>+447700900123</code>。消息不会自动保存到扩展配置。</p>
+
+    <label for="wa-phone">目标号码</label>
+    <input id="wa-phone" type="text" inputmode="tel" placeholder="+447700900123" autocomplete="off">
+
+    <label for="wa-text">消息正文</label>
+    <textarea id="wa-text" placeholder="输入要发送的 WhatsApp 消息…"></textarea>
+
+    <div class="row">
+      <input id="wa-keep-tab" type="checkbox">
+      <label for="wa-keep-tab" style="margin:0;font-weight:400;">发送成功后保留 WhatsApp 窗口（调试用）</label>
+    </div>
+
+    <button id="wa-send">发送 WhatsApp</button>
+    <div id="wa-status" aria-live="polite"></div>
+
+    <div class="note">
+      只会在你明确点击“发送 WhatsApp”后执行。失败时 WhatsApp 页面会保留，方便检查是否未登录、号码无效或网页选择器发生变化。Ctrl/Cmd + Enter 也可发送。
+    </div>
+  </main>
+  <script src="whatsapp_send_page.js"></script>
+</body>
+</html>
