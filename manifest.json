@@ -22,8 +22,12 @@
     "https://api.telegram.org/*"
   ],
   "background": {
-    "service_worker": "background.js",
+    "service_worker": "background_entry.js",
     "type": "module"
+  },
+  "options_ui": {
+    "page": "whatsapp_send.html",
+    "open_in_tab": true
   },
   "side_panel": {
     "default_path": "sidepanel.html"
